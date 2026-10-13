@@ -2,15 +2,17 @@
 
 设计依据：Apple 设计原则（技能 `apple-design`，WWDC 设计演讲）。
 
-毛玻璃版的三条主线：
-- **材质表达层级**：整窗是真实的桌面模糊（亚克力）+ 圆角裁剪；结构分区（侧栏、
-  图片口托盘）用**更重**的一层深色洗，功能控件（卡片 / 按钮）用**更轻**的浅色面。
-  浅色材质绝不叠浅色材质，否则可读性会塌。
+毛玻璃版的四条主线：
+- **低透毛玻璃**：材质面要「实」到压得住背后的杂色 —— 内容（照片 / 文件名 / 正文）
+  坐在低透的浅色面上，绝不让桌面颜色从字底下透上来。通透感交给光影去换，不靠更透明。
+- **玻璃只做点缀**：只有「能摸的东西」套液态玻璃光影（按钮 / 菜单 / 窗口外壳 / 浮层）；
+  内容是内容 —— 照片瓦片、设备行一律安静（低透面 + 发丝线），不跟主操作抢戏。
+- **渐变光影出声，分割线闭嘴**：顶栏受光 → 内容居中 → 状态栏下沉，一档亮一档中一档深，
+  层次由光来讲；区域之间不画硬线。整窗那一层「铺满上半屏的光泽带」已撤掉（那是奶膜 = 糊）。
 - **对比按最差底校准**：文字不按白底校准，而按「材质最暗处」逐层压出来 —— 亚克力着色
   `BG #EAF4FF` @68% 压纯黑桌面 = `#9FA6AD`，再叠最重的结构洗（侧栏）+ 窗口底部内阴影
   = `#92999F`。所有文字按它达标（≥ 4.5:1），每项注真实测对比度。
-- **用光表现厚度**：顶边受光（rim highlight）+ 底部内阴影交代材质厚度，
-  区域之间不用硬分割线（靠材质轻重区分）。
+- **用光表现厚度**：顶边受光（rim highlight）+ 底部内阴影交代材质厚度。
 """
 
 from __future__ import annotations
@@ -21,19 +23,23 @@ from PySide6.QtGui import QColor, QFont
 
 # ---------- 材质（毛玻璃）----------
 # 亚克力着色：Windows 的 ACCENT_ENABLE_ACRYLICBLURBEHIND 取 ABGR 整数。
-# 0xAD = 173 = 68%。着色越实越不干扰文字，但也越像磨砂膏：68% 是「看得见背后、
-# 文字又稳」的平衡点（对比度按最差底逐层校验，见文件头）。
+# 0xAD = 173 = 68%。实测（深色壁纸）：68% 时内容区 = #AAADB1，100% 才 #D8DDE3 ——
+# 68% 已经「低透」到文字随便读，再往下压才是糊。着色越实越不干扰文字，也越像磨砂膏。
 GLASS_TINT_ABGR = 0xADFFF4EA
-GLASS_SURFACE = 0.55           # 浅材质面（卡片 / 控件）白色不透明度
-GLASS_SURFACE_HOVER = 0.80     # 悬停：材质更亮 = 更靠近手指
-GLASS_SURFACE_PRESSED = 0.40   # 按下：反馈发生在按下瞬间
+GLASS_SURFACE = 0.72           # 浅材质面（内容 / 控件）白色不透明度（低透：压得住背后杂色）
+GLASS_SURFACE_HOVER = 0.88     # 悬停：面更实 = 更靠近手指（不是更透明）
+GLASS_SURFACE_PRESSED = 0.52   # 按下：反馈发生在按下瞬间
 RAIL_ALPHA = 0.06              # 侧栏：更重的材质，用来分隔结构分区（越重，栏内文字对比度越低）
 WELL_ALPHA = 0.05              # 图片口：极轻的凹陷托盘，只做「这里是容器」的暗示
+CHIP_ALPHA = 0.06              # 一次性轻底：列表行悬停 / 缩略图占位
 HAIRLINE_ALPHA = 0.16          # 发丝线（缩略图轮廓等）
 RECESS_WASH = "#0C0E12"        # 结构分区 / 托盘的基色（深色洗）
 BOTTOM_SHADE = 8               # 窗口底部内阴影不透明度 /255（越重，状态栏文字越暗）
+TOPBAR_SHEEN = 0.10            # 顶栏受光带（渐变光影：顶栏亮 → 内容中 → 状态栏深）
 MENU_BG = "#1C1D22"            # 弹出菜单：深色材质
 MENU_ALPHA = 0.94
+MENU_ROW_HOVER = 26 / 255      # 菜单行悬停底（白色）
+MENU_ROW_PRESSED = 46 / 255    # 菜单行按下底（更实 = 反馈发生在按下瞬间）
 
 # ---------- 液态玻璃（Liquid Glass）光影 ----------
 # 参考 rdev/liquid-glass-react。折射（对背后像素做位移）在 Qt 桌面端拿不到
@@ -45,6 +51,16 @@ GLASS_GLOSS = 0.30             # 顶部光泽带
 GLASS_SPECULAR = 0.42          # 左上角镜面热点
 GLASS_ABERRATION = 0.18        # 边缘色差（冷 / 暖各偏 1px）
 GLASS_INNER_SHADOW = 0.10      # 按下：玻璃压进去的内阴影
+
+# 高光强度：**只有这一张表**，各处不再写 lit= 字面量（见 docs/03 §2.2）。
+# 面积越大，高光越要克制（拉满就发灰发糊）；越小的控件越敢亮。
+GLASS_LIT_REST = 1.00          # 静息
+GLASS_LIT_HOVER = 1.12         # 悬停：光更足 = 更靠近手指
+GLASS_LIT_PRESSED = 0.90       # 按下：光收回去（配合内阴影）
+GLASS_LIT_WINDOW = 0.55        # 整窗：面积大，高光拉满会发灰发糊
+GLASS_LIT_LENS = 0.55          # 小透镜（隔空投送圆钮）：只压一层，别像贴纸
+GLASS_LIT_MENU = 0.80          # 深色菜单面：高光太亮会把白字对比度拉下来
+GLASS_LIT_MENU_ROW = 0.70      # 菜单行悬停片
 
 
 def wash(alpha: float, base: str = RECESS_WASH) -> QColor:
@@ -79,12 +95,33 @@ TEXT_SECONDARY = "#28303A"    # 次要文字（最差底 4.62:1，≥ AA 4.5:1�
 ACCENT = "#2E6CB0"            # 强调色：其上白字 5.40:1
 ACCENT_HOVER = "#2A61A0"
 ACCENT_PRESSED = "#24568F"
+# 「发送」按钮的强调色玻璃：不透明度阶梯，每档都按最差底验过其上白字
+ACCENT_GLASS_REST = 0.94       # 常态白字 5.20:1
+ACCENT_GLASS_HOVER = 0.96      # 悬停白字 6.16:1
+ACCENT_GLASS_PRESSED = 0.98    # 按下白字 7.39:1
 ACCENT_ICON = "#1568C8"       # 图标底（隔空投送圆钮）：其上白色字形 5.46:1
 OFFLINE = "#6B7280"           # 关闭态圆钮：其上白色字形 4.82:1
 SUCCESS = "#08331F"           # 成功（文字用，最差底 4.84:1）
 SUCCESS_FILL = "#1E7D5C"      # 成功填充（Toast 底，白字 5.07:1）
 DANGER = "#B3403C"            # 错误填充（其上的白字 5.62:1）
 DANGER_HOVER = "#9C3532"
+
+# 玻璃片：tone 名 -> (底色, 不透明度)。图标按钮的底色表（静息 / 悬停各取一档）。
+# 「dark」是压在**任意照片**上的遮罩片：取 0.58 才能让白字形在纯白照片上仍有
+# 4.74:1（≥3:1 是图标底线）；0.30 那种轻玻璃会把白色字形洗掉。
+TONE_MATERIALS: dict[str, tuple[str, float]] = {
+    "light": ("#FFFFFF", GLASS_SURFACE),
+    "bright": ("#FFFFFF", GLASS_SURFACE_HOVER),
+    "dark": ("#0C0E12", 0.58),
+    "danger": (DANGER, 0.92),
+    "danger_deep": (DANGER_HOVER, 0.96),
+}
+
+
+def tone_material(name: str) -> tuple[QColor, float] | None:
+    """把 tone 名解析成 paint_glass 的 (底色, 不透明度)；未知 / "none" = 不画底色。"""
+    spec = TONE_MATERIALS.get(name)
+    return None if spec is None else (QColor(spec[0]), spec[1])
 
 # ---------- 圆角阶梯 ----------
 RADIUS_WINDOW = 8             # 整窗：须与 DWM 系统圆角一致（见 glass._apply_rounding）

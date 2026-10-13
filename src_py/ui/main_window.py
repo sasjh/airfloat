@@ -70,14 +70,23 @@ from .glyphs import paint_glyph
 from .liquid import GlassSurface, PressSpring, glass_path, paint_glass, scaled_rect
 from .styles import (
     ACCENT,
+    ACCENT_GLASS_HOVER,
+    ACCENT_GLASS_PRESSED,
+    ACCENT_GLASS_REST,
     ACCENT_HOVER,
     ACCENT_ICON,
     ACCENT_PRESSED,
     BG,
     BOTTOM_SHADE,
-    DANGER,
-    DANGER_HOVER,
+    CHIP_ALPHA,
     DEFAULT_DEVICE_GLYPH,
+    GLASS_LIT_HOVER,
+    GLASS_LIT_LENS,
+    GLASS_LIT_MENU,
+    GLASS_LIT_MENU_ROW,
+    GLASS_LIT_PRESSED,
+    GLASS_LIT_REST,
+    GLASS_LIT_WINDOW,
     GLASS_SURFACE,
     GLASS_SURFACE_HOVER,
     GLASS_SURFACE_PRESSED,
@@ -85,6 +94,8 @@ from .styles import (
     HAIRLINE_ALPHA,
     MENU_ALPHA,
     MENU_BG,
+    MENU_ROW_HOVER,
+    MENU_ROW_PRESSED,
     OFFLINE,
     QSS,
     RADIUS_CARD,
@@ -99,10 +110,12 @@ from .styles import (
     SPACE_5,
     TEXT,
     TEXT_SECONDARY,
+    TOPBAR_SHEEN,
     WELL_ALPHA,
     animations_enabled,
     apply_type,
     device_glyph,
+    tone_material,
     type_font,
     wash,
 )
@@ -156,7 +169,6 @@ MENU_W = 196
 MENU_ROW_H = 44
 MENU_PAD = 6
 MENU_SHADOW = 14               # 菜单四周留给投影的透明边
-HOVER_WHITE = 26               # 菜单行悬停底（白色不透明度 / 255）
 
 
 # --------------------------------------------------------------------------- #
@@ -220,24 +232,6 @@ def _load_thumb(path: str, w: int, h: int) -> QPixmap | None:
 # --------------------------------------------------------------------------- #
 # 小控件：矢量图标（毛玻璃上不用 emoji —— 彩色 emoji 会显脏、基线也对不齐）
 # --------------------------------------------------------------------------- #
-# 图标按钮的液态玻璃片：tone -> (底色, 不透明度)
-# 「dark」是照片上的遮罩片，压的是**任意照片色**：取 0.58 才能保证白字形在纯白照片上
-# 仍有 4.74:1（≥3:1 是图标底线），0.30 那种轻玻璃会把白色字形洗掉。
-_TONES: dict[str, tuple[str, float]] = {
-    "light": ("#FFFFFF", GLASS_SURFACE),
-    "bright": ("#FFFFFF", GLASS_SURFACE_HOVER),
-    "dark": ("#0C0E12", 0.58),
-    "danger": (DANGER, 0.92),
-    "danger_deep": (DANGER_HOVER, 0.96),
-}
-
-
-def _tone(name: str) -> tuple[QColor, float] | None:
-    """把 tone 名解析成 paint_glass 的 (底色, 不透明度)；未知 / "none" = 不画底色。"""
-    spec = _TONES.get(name)
-    return None if spec is None else (QColor(spec[0]), spec[1])
-
-
 class _GlyphButton(QToolButton):
     """矢量图标按钮：图标由 QPainter 画，底色是液态玻璃片（悬停 / 按下带材质与回弹）。"""
 
@@ -306,16 +300,22 @@ class _GlyphButton(QToolButton):
         rect = scaled_rect(
             QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0), self._spring.scale
         )
-        fill = _tone(self._glass_tone())
+        fill = tone_material(self._glass_tone())
         if fill is not None:
             tint, alpha = fill
+            if self._pressed:
+                lit = GLASS_LIT_PRESSED
+            elif self._hover:
+                lit = GLASS_LIT_HOVER
+            else:
+                lit = GLASS_LIT_REST
             paint_glass(
                 p,
                 rect,
                 RADIUS_CONTROL,
                 tint=tint,
                 alpha=alpha,
-                lit=0.9 if self._pressed else 1.1,
+                lit=lit,
                 pressed=self._pressed,
                 specular=False,
             )
@@ -370,11 +370,11 @@ class _SendButton(QPushButton):
             QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0), self._spring.scale
         )
         if self._pressed:
-            tint, alpha, lit = ACCENT_PRESSED, 0.98, 0.9
+            tint, alpha, lit = ACCENT_PRESSED, ACCENT_GLASS_PRESSED, GLASS_LIT_PRESSED
         elif self._hover:
-            tint, alpha, lit = ACCENT_HOVER, 0.96, 1.12
+            tint, alpha, lit = ACCENT_HOVER, ACCENT_GLASS_HOVER, GLASS_LIT_HOVER
         else:
-            tint, alpha, lit = ACCENT, 0.94, 1.0
+            tint, alpha, lit = ACCENT, ACCENT_GLASS_REST, GLASS_LIT_REST
         paint_glass(
             p,
             rect,
@@ -431,7 +431,7 @@ class DeviceItemDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
         elif hovered:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(wash(0.06))
+            painter.setBrush(wash(CHIP_ALPHA))
             painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
 
         alias = index.data(Qt.ItemDataRole.UserRole) or index.text() or "未知设备"
@@ -509,16 +509,18 @@ class ThumbWidget(QWidget):
         card = QRectF(0, 0, w, h)
         path = glass_path(card, RADIUS_CARD)
 
-        # 液态玻璃片：镜面边缘光 + 顶部光泽（图片压在它上面，只有边缘和文件名条露得出来）
+        # 内容是内容：照片瓦片只留「低透的面 + 发丝线」，不套玻璃光影 —— 玻璃只做点缀。
+        # 图片压在上面，露出来的只有文件名条；面要实到压得住背后杂色，文件名才不糊。
         paint_glass(
             p,
             card,
             RADIUS_CARD,
             tint=QColor(255, 255, 255),
             alpha=GLASS_SURFACE,
-            lit=0.9,
+            gloss=False,
             specular=False,
             aberration=False,
+            rim=False,
         )
         p.setPen(QPen(wash(HAIRLINE_ALPHA), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -529,7 +531,7 @@ class ThumbWidget(QWidget):
         if self._pixmap is not None:
             p.drawPixmap(img_rect.toRect(), self._pixmap)
         else:
-            p.fillRect(img_rect, wash(0.06))
+            p.fillRect(img_rect, wash(CHIP_ALPHA))
             side = 24.0
             paint_glyph(
                 p,
@@ -783,11 +785,11 @@ class AirdropCard(QWidget):
         # 液态玻璃：镜面边缘光 + 顶部光泽 + 左上镜面热点 + 边缘色差。
         card_pressed = self._pressed and not self._icon_pressed
         if card_pressed:
-            alpha, lit = GLASS_SURFACE_PRESSED, 0.9   # 按下就变，不等抬起
+            alpha, lit = GLASS_SURFACE_PRESSED, GLASS_LIT_PRESSED   # 按下就变，不等抬起
         elif self._hover:
-            alpha, lit = GLASS_SURFACE_HOVER, 1.15
+            alpha, lit = GLASS_SURFACE_HOVER, GLASS_LIT_HOVER
         else:
-            alpha, lit = GLASS_SURFACE, 1.0
+            alpha, lit = GLASS_SURFACE, GLASS_LIT_REST
         paint_glass(
             p,
             rect,
@@ -809,7 +811,7 @@ class AirdropCard(QWidget):
         p.setBrush(fill)
         p.drawEllipse(icon)
         # 圆钮也是一枚小透镜：压一层高光，否则像贴纸
-        paint_glass(p, icon, icon.width() / 2.0, lit=0.55, aberration=False)
+        paint_glass(p, icon, icon.width() / 2.0, lit=GLASS_LIT_LENS, aberration=False)
         paint_glyph(p, "airdrop", icon.adjusted(SPACE_3, SPACE_3, -SPACE_3, -SPACE_3), QColor("#FFFFFF"))
 
         # 取值行尾的展开提示
@@ -887,7 +889,9 @@ class _MenuPanel(QFrame):
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         # 深色液态玻璃：底色 + 顶部光泽 + 镜面边缘光。
         # lit 压到 0.8：深色面上高光太亮会发灰，白字对比度反而掉。
-        paint_glass(p, rect, RADIUS_MENU, tint=QColor(MENU_BG), alpha=MENU_ALPHA, lit=0.8)
+        paint_glass(
+            p, rect, RADIUS_MENU, tint=QColor(MENU_BG), alpha=MENU_ALPHA, lit=GLASS_LIT_MENU
+        )
         p.end()
 
 
@@ -936,8 +940,8 @@ class _ModeRow(QWidget):
                 rect,
                 RADIUS_CONTROL,
                 tint=QColor(255, 255, 255),
-                alpha=(46 if self._pressed else HOVER_WHITE) / 255.0,
-                lit=0.7,
+                alpha=MENU_ROW_PRESSED if self._pressed else MENU_ROW_HOVER,
+                lit=GLASS_LIT_MENU_ROW,
                 pressed=self._pressed,
                 specular=False,
                 aberration=False,
@@ -1908,9 +1912,24 @@ class AirFloatWindow(QWidget):
             p.setBrush(base)
             p.drawPath(path)
 
-        # 液态玻璃：镜面边缘光（对角受光）+ 顶部光泽 + 左上镜面热点 + 边缘色差。
-        # lit 压到 0.55：整窗面积大，高光拉满会发灰发糊。
-        paint_glass(p, rect, radius, lit=0.55)
+        # 液态玻璃：镜面边缘光（对角受光）+ 左上镜面热点 + 边缘色差。
+        # 整窗不铺光泽带（gloss=False）：铺满上半屏的那层白是「奶膜」，正是糊感的来源；
+        # 光集中给顶栏（下一条受光带），内容区留干净 —— 低透的面才压得住背后的杂色。
+        paint_glass(p, rect, radius, lit=GLASS_LIT_WINDOW, gloss=False)
+
+        # 顶栏受光带：渐变光影把「顶栏 → 内容 → 状态栏」拉成一档亮、一档中、一档深，
+        # 层次由光说，不用分割线。
+        if TOPBAR_SHEEN > 0:
+            band = QRectF(0.0, 0.0, float(self.width()), float(TOPBAR_H))
+            sheen = QLinearGradient(band.topLeft(), band.bottomLeft())
+            sheen.setColorAt(0.0, QColor(255, 255, 255, round(255 * TOPBAR_SHEEN)))
+            sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(sheen)
+            p.save()
+            p.setClipPath(path)
+            p.drawRect(band)
+            p.restore()
 
         # 底部内阴影：交代材质下沉，玻璃不是一块平板。
         # 它压着状态栏文字，所以不透明度是令牌（BOTTOM_SHADE），要跟对比度一起调。

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 
@@ -336,17 +337,22 @@ def main() -> int:
     ):
         check(f"{label}确实画了", _pixel_diff(rim, _glass_probe(**kwargs)) > 0)
     # 按下：内阴影把顶边压暗（同一块玻璃，按下后更暗）
-    flat = {"tint": QColor("#FFFFFF"), "alpha": 0.55, "gloss": False, "specular": False,
+    flat = {"tint": QColor("#FFFFFF"), "alpha": styles.GLASS_SURFACE,
+            "gloss": False, "specular": False,
             "aberration": False, "rim": False}
     plain, dent = _glass_probe(**flat), _glass_probe(**flat, pressed=True)
     check("按下压出内阴影（顶边变暗）",
           dent.pixelColor(40, 3).lightness() < plain.pixelColor(40, 3).lightness(),
           f"{dent.pixelColor(40, 3).lightness()} vs {plain.pixelColor(40, 3).lightness()}")
-    # 浅材质面是半透明的（实底会把背后的模糊挡死）
+    # 浅材质面是「低透」：不是实底（背后模糊会被挡死），也不能让背后脏色透上来。
+    # 上下界直接由令牌推出，改 GLASS_SURFACE 就必须重算，不会和注释漂移。
+    surface = styles.GLASS_SURFACE
     face = _glass_probe(
-        tint=QColor("#FFFFFF"), alpha=0.55, gloss=False, specular=False, aberration=False, rim=False
+        tint=QColor("#FFFFFF"), alpha=surface, gloss=False, specular=False,
+        aberration=False, rim=False
     ).pixelColor(40, 20).alpha()
-    check("浅材质面半透明（落在 0.55 的上下渐变里，不是实底）", 115 <= face <= 160, str(face))
+    low, high = round(255 * surface * 0.84), round(255 * surface * 1.12)
+    check(f"浅材质面低透（{low} ≤ alpha ≤ {high}）", low <= face <= high, str(face))
     # 回弹：按下缩一点、松手弹回
     spring = mw.PressSpring(window)
     spring.press()
@@ -357,9 +363,9 @@ def main() -> int:
     check("松手弹回原尺寸", abs(spring.scale - 1.0) < 1e-6, f"{spring.scale:.3f}")
     # 玻璃是半透明的：白字压在强调色玻璃上（最差底）也得 ≥ 4.5:1
     for label, color, alpha in (
-        ("常态", styles.ACCENT, 0.94),
-        ("悬停", styles.ACCENT_HOVER, 0.96),
-        ("按下", styles.ACCENT_PRESSED, 0.98),
+        ("常态", styles.ACCENT, styles.ACCENT_GLASS_REST),
+        ("悬停", styles.ACCENT_HOVER, styles.ACCENT_GLASS_HOVER),
+        ("按下", styles.ACCENT_PRESSED, styles.ACCENT_GLASS_PRESSED),
     ):
         ratio = _contrast("#FFFFFF", _flatten(color, alpha, worst))
         check(f"发送键白字（{label}）{ratio:.2f}:1 ≥ 4.5", ratio >= 4.5)
@@ -373,7 +379,9 @@ def main() -> int:
           (probe_thumb._delete_btn._rest_tone, probe_thumb._delete_btn._hover_tone) == ("dark", "danger"))
     probe_thumb.deleteLater()
     check("tone 表认得 light，未知回退 None",
-          mw._tone("light") is not None and mw._tone("none") is None and mw._tone("nope") is None)
+          styles.tone_material("light") is not None
+          and styles.tone_material("none") is None
+          and styles.tone_material("nope") is None)
     # 删除键压在**任意照片**上：最差是纯白照片，白字形也得 ≥ 3:1
     scrim = _flatten("#0C0E12", 0.58, "#FFFFFF")
     ratio = _contrast("#FFFFFF", scrim)
@@ -382,6 +390,65 @@ def main() -> int:
           "QFrame#sidebar { background: transparent; }" in styles.QSS
           and "QFrame#imagePort { background: transparent; }" in styles.QSS
           and "QPushButton#sendBtn:hover" not in styles.QSS)
+
+    print("\n[16] 层级与克制：低透面 / 渐变光影 / 玻璃只做点缀")
+    # ① 材质阶梯：悬停要更「实」（不是更透明），按下退回去
+    check("浅材质面阶梯：悬停 > 静息 > 按下",
+          styles.GLASS_SURFACE_HOVER > styles.GLASS_SURFACE > styles.GLASS_SURFACE_PRESSED,
+          f"{styles.GLASS_SURFACE_HOVER} / {styles.GLASS_SURFACE} / {styles.GLASS_SURFACE_PRESSED}")
+    # ② 玻璃只做点缀：内容（照片瓦片）不再套玻璃光影，只留低透的面 + 发丝线
+    seen: dict = {}
+    real_paint = mw.paint_glass
+    mw.paint_glass = lambda p, r, rad, **kw: seen.update(kw)
+    tile = mw.ThumbWidget(paths[0], "tile.png")
+    tile.resize(mw.THUMB_W, mw.THUMB_CELL_H)
+    tile.paintEvent(None)
+    mw.paint_glass = real_paint
+    check("内容瓦片不套玻璃光影（玻璃只做点缀）",
+          not any(seen.get(key) for key in ("gloss", "specular", "aberration", "rim")), str(seen))
+    check("内容瓦片的面取自 GLASS_SURFACE 令牌",
+          seen.get("alpha") == styles.GLASS_SURFACE, str(seen.get("alpha")))
+    tile.deleteLater()
+    # ③ 整窗不再铺满光泽带（那层铺满上半屏的白就是「奶膜」= 糊）
+    shell: list = []
+    mw.paint_glass = lambda p, r, rad, **kw: shell.append(kw)
+    window.paintEvent(None)
+    mw.paint_glass = real_paint
+    check("整窗不铺光泽带（gloss=False）", bool(shell) and shell[0].get("gloss") is False, str(shell))
+    check("整窗高光走令牌且比控件克制",
+          shell[0].get("lit") == styles.GLASS_LIT_WINDOW < styles.GLASS_LIT_REST,
+          str(shell[0].get("lit")))
+    # ④ 规范统一：高光强度只有一张表，组件里不准再出现 lit= 字面量
+    source = open(mw.__file__, encoding="utf-8").read()
+    check("光影强度全部走令牌（组件里没有 lit= 字面量）", re.search(r"lit=\d", source) is None)
+    check("tone 材质表已搬到 styles（唯一令牌来源）", not hasattr(mw, "_TONES"))
+    # ⑤ 渐变光影：顶栏受光带要压得住正下方；整窗一档亮在顶、一档深在底。
+    # 离屏环境会按降级路径铺一层纯色薄膜（那是给人看的兜底），会盖住光本身 ——
+    # 这里临时把薄膜关掉，才量得到「光」的分布。
+    saved_mode = window._material._mode
+    window._material._mode = ui_glass.MODE_ACRYLIC
+    window.show()
+    app.processEvents()
+    QTest.qWait(120)
+    shot = window.grab().toImage()
+    window._material._mode = saved_mode
+    canvas = QImage(shot.size(), QImage.Format.Format_RGB32)
+    canvas.fill(QColor("#808080"))          # 窗口是半透明的：先压到固定中灰再比亮度
+    cp = QPainter(canvas)
+    cp.drawImage(0, 0, shot)
+    cp.end()
+
+    def band_lum(y: int) -> float:
+        # 只量顶栏右半段：既躲开左上角镜面热点（它在侧栏上方），也躲开右上角的图标按钮
+        left, right = max(mw.SIDEBAR_W + 8, canvas.width() // 2), canvas.width() - 60
+        row = [canvas.pixelColor(x, y).lightness() for x in range(left, right, 6)]
+        return sum(row) / max(1, len(row))
+
+    top = band_lum(6)                       # 受光带顶部
+    below = band_lum(mw.TOPBAR_H - 6)       # 受光带底部（仍在顶栏内，只差渐变）
+    foot = band_lum(canvas.height() - 6)
+    check("顶栏受光带：上亮下暗（渐变光影）", top > below, f"{top:.1f} vs {below:.1f}")
+    check("渐变光影：顶亮底深（一档亮、一档深）", top > foot, f"{top:.1f} vs {foot:.1f}")
 
     check("自测没有写用户真实配置", _snapshot(QSettings(*real_scope)) == real_before)
     QSettings(mw.SETTINGS_ORG, mw.SETTINGS_APP).clear()
