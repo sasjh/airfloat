@@ -48,6 +48,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -65,16 +67,25 @@ from PySide6.QtWidgets import (
 )
 
 from .styles import (
+    ACCENT,
     BG,
     CARD,
     DEFAULT_DEVICE_ICON,
     DIVIDER,
     OFFLINE,
-    PRIMARY,
     QSS,
+    RADIUS_CARD,
+    RADIUS_CONTROL,
+    SPACE_1,
+    SPACE_2,
+    SPACE_3,
+    SPACE_4,
     TEXT,
     TEXT_SECONDARY,
+    animations_enabled,
+    apply_type,
     device_icon,
+    type_font,
 )
 
 # HEIC 解码（pillow-heif 注册到 Pillow，兜底 Qt 不支持的格式）
@@ -90,10 +101,15 @@ except Exception:
 MODE_LABELS = {"everyone": "所有人", "contacts": "仅联系人", "off": "接收关闭"}
 MODE_ORDER = ("everyone", "contacts", "off")
 
-WINDOW_W, WINDOW_H = 360, 500
+# 内容区按 docs/03 为 360×500；窗口四周再留 GUTTER 给投影，定义「浮窗」的层次。
+CONTENT_W, CONTENT_H = 360, 500
+GUTTER = 12
+WINDOW_W, WINDOW_H = CONTENT_W + 2 * GUTTER, CONTENT_H + 2 * GUTTER
 SIDEBAR_W = 158
 TOPBAR_H = 40
-STATUSBAR_H = 30
+STATUSBAR_H = 36
+ICON_BTN = 26
+SEND_BTN_W, SEND_BTN_H = 76, 30
 
 # 缩略图网格
 THUMB_W = 84
@@ -176,7 +192,11 @@ def _load_thumb(path: str, w: int, h: int) -> QPixmap | None:
 # 开关（iOS 风格，开=蓝 / 关=灰）
 # --------------------------------------------------------------------------- #
 class ToggleSwitch(QAbstractButton):
-    """无边框圆角开关，带拇指滑动动画。"""
+    """无边框圆角开关，带拇指滑动动画。
+
+    动效：短促 ease-out（Apple：默认不回弹，只有带惯性的手势才回弹），
+    且从「当前值」起步，因此连点可打断、不跳变；系统关闭动画时直接落终态。
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -185,8 +205,8 @@ class ToggleSwitch(QAbstractButton):
         self.setFixedSize(44, 26)
         self._offset = 0.0
         self._anim = QPropertyAnimation(self, b"offset", self)
-        self._anim.setDuration(160)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._anim.setDuration(150 if animations_enabled() else 0)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.toggled.connect(self._on_toggled)
 
     # -- 动画属性 --
@@ -198,6 +218,11 @@ class ToggleSwitch(QAbstractButton):
         self.update()
 
     offset = Property(float, _get_offset, _set_offset)
+
+    def sync_checked(self, checked: bool) -> None:
+        """程序化同步状态：直接落到终态，不播动画，保证画面与逻辑状态一致。"""
+        self._anim.stop()
+        self._set_offset(1.0 if checked else 0.0)
 
     def _on_toggled(self, checked: bool) -> None:
         self._anim.stop()
@@ -213,7 +238,7 @@ class ToggleSwitch(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        track = _blend(QColor(OFFLINE), QColor(PRIMARY), self._offset)
+        track = _blend(QColor(OFFLINE), QColor(ACCENT), self._offset)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(track))
         p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
@@ -224,6 +249,12 @@ class ToggleSwitch(QAbstractButton):
         d = h - 2 * margin
         p.setBrush(QBrush(QColor("#FFFFFF")))
         p.drawEllipse(QRectF(x, margin, d, d))
+
+        # 无障碍：自绘控件没有默认焦点环，键盘焦点必须可见
+        if self.hasFocus():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), (h - 2) / 2, (h - 2) / 2)
         p.end()
 
 
@@ -231,7 +262,7 @@ class ToggleSwitch(QAbstractButton):
 # 附近设备列表委托（emoji 图标 + 别名 + 类型，两行）
 # --------------------------------------------------------------------------- #
 class DeviceItemDelegate(QStyledItemDelegate):
-    """绘制设备条目：选中态高亮主蓝。"""
+    """绘制设备条目：emoji + 别名 + 类型两行；选中态用强调色实底。"""
 
     def sizeHint(self, _option, _index) -> QSize:  # noqa: D102
         return QSize(120, 46)
@@ -245,12 +276,12 @@ class DeviceItemDelegate(QStyledItemDelegate):
 
         if selected:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(PRIMARY))
-            painter.drawRoundedRect(rect, 8, 8)
+            painter.setBrush(QColor(ACCENT))
+            painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
         elif hovered:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(BG))
-            painter.drawRoundedRect(rect, 8, 8)
+            painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
 
         alias = index.data(Qt.ItemDataRole.UserRole) or index.text() or "未知设备"
         dtype = index.data(Qt.ItemDataRole.UserRole + 1) or ""
@@ -258,27 +289,32 @@ class DeviceItemDelegate(QStyledItemDelegate):
 
         x = rect.left() + 8
         icon_rect = QRectF(x, rect.top() + rect.height() / 2 - 11, 22, 22)
-        painter.setFont(QFont("Segoe UI Emoji", 12))
+        f_icon = QFont("Segoe UI Emoji")
+        f_icon.setPixelSize(13)
+        painter.setFont(f_icon)
         painter.setPen(QColor("#FFFFFF" if selected else TEXT))
         painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, emoji)
 
         text_x = icon_rect.right() + 7
         right = rect.right() - 6
 
-        f_alias = QFont(option.font)
-        f_alias.setPixelSize(13)
-        f_alias.setBold(True)
+        f_alias = type_font("itemTitle")
         painter.setFont(f_alias)
         painter.setPen(QColor("#FFFFFF" if selected else TEXT))
-        alias_elided = QFontMetrics(f_alias).elidedText(str(alias), Qt.TextElideMode.ElideRight, right - int(text_x))
-        painter.drawText(QPoint(int(text_x), rect.top() + 17), alias_elided)
+        alias_elided = QFontMetrics(f_alias).elidedText(
+            str(alias), Qt.TextElideMode.ElideRight, right - int(text_x)
+        )
+        painter.drawText(QPoint(int(text_x), rect.top() + 18), alias_elided)
 
-        f_type = QFont(option.font)
-        f_type.setPixelSize(11)
+        f_type = type_font("itemSub")
         painter.setFont(f_type)
-        painter.setPen(QColor("rgba(255,255,255,0.85)" if selected else TEXT_SECONDARY))
-        dtype_elided = QFontMetrics(f_type).elidedText(str(dtype), Qt.TextElideMode.ElideRight, right - int(text_x))
-        painter.drawText(QPoint(int(text_x), rect.top() + 31), dtype_elided)
+        # 注意：QColor 不认 CSS 的 "rgba(r,g,b,a)" 字符串（会得到无效色 -> 画成黑色），
+        # 半透明白要用整数构造函数。
+        painter.setPen(QColor(255, 255, 255, 230) if selected else QColor(TEXT_SECONDARY))
+        dtype_elided = QFontMetrics(f_type).elidedText(
+            str(dtype), Qt.TextElideMode.ElideRight, right - int(text_x)
+        )
+        painter.drawText(QPoint(int(text_x), rect.top() + 32), dtype_elided)
 
         painter.restore()
 
@@ -296,6 +332,7 @@ class ThumbWidget(QWidget):
         self.setFixedSize(THUMB_W, THUMB_CELL_H)
         self.setToolTip(self._file_name or self._file_path)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setFont(type_font("caption"))
         self._pixmap = _load_thumb(self._file_path, THUMB_W, THUMB_IMG_H)
         self._press_pos: QPoint | None = None
 
@@ -306,12 +343,12 @@ class ThumbWidget(QWidget):
 
         card = QRectF(0, 0, w, h)
         path = QPainterPath()
-        path.addRoundedRect(card, 8, 8)
+        path.addRoundedRect(card, RADIUS_CARD, RADIUS_CARD)
         p.setClipPath(path)
 
         p.setPen(QPen(QColor(DIVIDER), 1))
         p.setBrush(QColor(CARD))
-        p.drawRoundedRect(card, 8, 8)
+        p.drawRoundedRect(card, RADIUS_CARD, RADIUS_CARD)
 
         img_rect = QRectF(1, 1, w - 2, THUMB_IMG_H - 2)
         if self._pixmap is not None:
@@ -319,14 +356,15 @@ class ThumbWidget(QWidget):
         else:
             p.fillRect(img_rect, QColor(BG))
             p.setPen(QColor(TEXT_SECONDARY))
-            p.setFont(QFont("Segoe UI Emoji", 16))
+            f_ph = QFont("Segoe UI Emoji")
+            f_ph.setPixelSize(18)
+            p.setFont(f_ph)
             p.drawText(img_rect, Qt.AlignmentFlag.AlignCenter, "🖼️")
 
         p.setPen(QColor(TEXT_SECONDARY))
-        f = QFont(self.font())
-        f.setPixelSize(10)
+        f = type_font("caption")
         p.setFont(f)
-        name_rect = QRectF(5, THUMB_IMG_H + 1, w - 10, THUMB_NAME_H - 2)
+        name_rect = QRectF(6, THUMB_IMG_H + 1, w - 12, THUMB_NAME_H - 2)
         elided = QFontMetrics(f).elidedText(self._file_name, Qt.TextElideMode.ElideRight, int(name_rect.width()))
         p.drawText(name_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
         p.end()
@@ -379,14 +417,14 @@ class ImagePort(QFrame):
         self._empty_state = QWidget(self)
         ev = QVBoxLayout(self._empty_state)
         ev.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ev.setSpacing(6)
-        icon = QLabel("🖼️", self._empty_state)
+        ev.setSpacing(SPACE_2)
+        icon = apply_type(QLabel("🖼️", self._empty_state), "emptyIcon")
         icon.setObjectName("emptyIcon")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main = QLabel("手机发来的图会出现在这里", self._empty_state)
+        main = apply_type(QLabel("手机发来的图会出现在这里", self._empty_state), "emptyTitle")
         main.setObjectName("emptyMain")
         main.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = QLabel("拖图片进来可发给手机", self._empty_state)
+        sub = apply_type(QLabel("拖图片进来可发给手机", self._empty_state), "emptyBody")
         sub.setObjectName("emptySub")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev.addWidget(icon)
@@ -409,7 +447,7 @@ class ImagePort(QFrame):
         self._grid_host = QWidget()
         self._grid_host.setStyleSheet("background: transparent;")
         self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(8, 8, 8, 8)
+        self._grid.setContentsMargins(SPACE_2, SPACE_2, SPACE_2, SPACE_2)
         self._grid.setHorizontalSpacing(GRID_GAP)
         self._grid.setVerticalSpacing(GRID_GAP)
         self._grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -418,6 +456,7 @@ class ImagePort(QFrame):
         # 拖入提示浮层（透明于鼠标）
         self._drop_overlay = QLabel("松开以发送到所选设备", self)
         self._drop_overlay.setObjectName("dropOverlay")
+        self._drop_overlay.setFont(type_font("drop"))
         self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._drop_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._drop_overlay.hide()
@@ -531,6 +570,8 @@ class AirFloatWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(WINDOW_W, WINDOW_H)
         self.setStyleSheet(QSS)
+        # 让窗口自身可持有焦点：启动时焦点环不落在某个次要按钮上（键盘 Tab 时仍可见）
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         # -- 状态 --
         self._protocol = None
@@ -558,29 +599,42 @@ class AirFloatWindow(QWidget):
     # 构建 UI
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(GUTTER, GUTTER, GUTTER, GUTTER)
+        outer.setSpacing(0)
+
+        # 窗口主体：承载投影，给「浮窗」以深度（Apple：浮动层需要层次）
+        self._body = QFrame(self)
+        self._body.setObjectName("windowBody")
+        self._body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        shadow = QGraphicsDropShadowEffect(self._body)
+        shadow.setBlurRadius(26)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(31, 45, 61, 70))
+        self._body.setGraphicsEffect(shadow)
+        outer.addWidget(self._body)
+
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 顶栏
-        topbar = TopBar(self)
+        # 顶栏：品牌 + 本机别名 + 打开接收目录 + 关闭（无边框窗口的拖拽区）
+        topbar = TopBar(self._body)
         tb = QHBoxLayout(topbar)
-        tb.setContentsMargins(12, 0, 8, 0)
-        tb.setSpacing(8)
-        brand = QLabel("AirFloat", topbar)
+        tb.setContentsMargins(SPACE_3, 0, SPACE_2, 0)
+        tb.setSpacing(SPACE_2)
+        brand = apply_type(QLabel("AirFloat", topbar), "brand")
         brand.setObjectName("brandName")
-        self._self_alias_label = QLabel("", topbar)
+        self._self_alias_label = apply_type(QLabel("", topbar), "alias")
         self._self_alias_label.setObjectName("selfAlias")
         self._self_alias_label.setVisible(False)
-        self._folder_btn = QToolButton(topbar)
-        self._folder_btn.setObjectName("folderBtn")
-        self._folder_btn.setText("📁")
-        self._folder_btn.setToolTip("打开接收目录")
-        self._folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._folder_btn = self._make_icon_button(topbar, "folderBtn", "📁", "打开接收目录")
+        self._close_btn = self._make_icon_button(topbar, "closeBtn", "✕", "关闭窗口")
         tb.addWidget(brand)
         tb.addWidget(self._self_alias_label)
         tb.addStretch(1)
         tb.addWidget(self._folder_btn)
+        tb.addWidget(self._close_btn)
         root.addWidget(topbar)
 
         # 主体（两栏）
@@ -589,48 +643,58 @@ class AirFloatWindow(QWidget):
         main.setSpacing(0)
 
         # 左窄栏
-        sidebar = QFrame(self)
+        sidebar = QFrame(self._body)
         sidebar.setObjectName("sidebar")
         sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         sidebar.setFixedWidth(SIDEBAR_W)
         sb = QVBoxLayout(sidebar)
-        sb.setContentsMargins(10, 12, 10, 10)
-        sb.setSpacing(8)
+        sb.setContentsMargins(SPACE_3, SPACE_3 + 2, SPACE_3, SPACE_3)
+        sb.setSpacing(0)
 
         # ① 隔空投送开关
         switch_row = QHBoxLayout()
-        switch_row.setSpacing(6)
-        switch_label = QLabel("隔空投送", sidebar)
+        switch_row.setContentsMargins(0, 0, 0, 0)
+        switch_row.setSpacing(SPACE_2)
+        switch_label = apply_type(QLabel("隔空投送", sidebar), "rowLabel")
         switch_label.setObjectName("rowLabel")
         self._switch = ToggleSwitch(sidebar)
         switch_row.addWidget(switch_label)
         switch_row.addStretch(1)
         switch_row.addWidget(self._switch)
         sb.addLayout(switch_row)
+        sb.addSpacing(SPACE_4)
 
-        # ② 可接收对象
-        group_title = QLabel("可接收对象", sidebar)
+        # ② 可接收对象（组内紧凑、组间拉开：用邻近性表达从属关系）
+        group_title = apply_type(QLabel("可接收对象", sidebar), "groupTitle")
         group_title.setObjectName("groupTitle")
         sb.addWidget(group_title)
+        sb.addSpacing(SPACE_1)
 
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
         self._mode_buttons: list[QPushButton] = []
+        mode_box = QVBoxLayout()
+        mode_box.setContentsMargins(0, 0, 0, 0)
+        mode_box.setSpacing(2)
         for mode in MODE_ORDER:
             btn = QPushButton(MODE_LABELS[mode], sidebar)
             btn.setObjectName("modeOption")
             btn.setCheckable(True)
             btn.setProperty("mode", mode)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.toggled.connect(lambda checked, m=mode: self._on_mode_toggled(m, checked))
+            apply_type(btn, "control")
+            btn.toggled.connect(lambda checked, m=mode, b=btn: self._on_mode_toggled(m, b, checked))
             self._mode_group.addButton(btn)
             self._mode_buttons.append(btn)
-            sb.addWidget(btn)
+            mode_box.addWidget(btn)
+        sb.addLayout(mode_box)
+        sb.addSpacing(SPACE_4)
 
         # ③ 附近设备
-        dev_title = QLabel("附近设备", sidebar)
+        dev_title = apply_type(QLabel("附近设备", sidebar), "groupTitle")
         dev_title.setObjectName("groupTitle")
         sb.addWidget(dev_title)
+        sb.addSpacing(SPACE_1)
 
         self._device_list = QListWidget(sidebar)
         self._device_list.setObjectName("deviceList")
@@ -639,53 +703,54 @@ class AirFloatWindow(QWidget):
         self._device_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._device_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._device_list.setSpacing(2)
-        sb.addWidget(self._device_list, 1)
+        self._device_list.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._device_empty = QLabel("未发现手机，请确认同一 WiFi", sidebar)
+        self._device_empty = apply_type(QLabel("未发现手机，请确认同一 WiFi", sidebar), "itemSub")
         self._device_empty.setObjectName("deviceEmpty")
         self._device_empty.setWordWrap(True)
         self._device_empty.setVisible(False)
         sb.addWidget(self._device_empty)
+        sb.addWidget(self._device_list, 1)
 
         main.addWidget(sidebar)
 
         # 右宽栏「图片口」
-        self._image_port = ImagePort(self)
+        self._image_port = ImagePort(self._body)
         main.addWidget(self._image_port, 1)
 
         root.addLayout(main, 1)
 
         # 底部状态栏
-        statusbar = QFrame(self)
+        statusbar = QFrame(self._body)
         statusbar.setObjectName("statusbar")
         statusbar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         statusbar.setFixedHeight(STATUSBAR_H)
         st = QHBoxLayout(statusbar)
-        st.setContentsMargins(12, 0, 12, 0)
-        st.setSpacing(10)
+        st.setContentsMargins(SPACE_3, 0, SPACE_3, 0)
+        st.setSpacing(SPACE_2)
 
         self._progress_container = QWidget(statusbar)
         pc = QHBoxLayout(self._progress_container)
         pc.setContentsMargins(0, 0, 0, 0)
-        pc.setSpacing(8)
+        pc.setSpacing(SPACE_2)
         self._progress = QProgressBar(self._progress_container)
         self._progress.setObjectName("sendProgress")
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
         self._progress.setTextVisible(False)
-        self._progress.setFixedSize(110, 6)
-        self._progress_label = QLabel("", self._progress_container)
+        self._progress.setFixedSize(100, 6)
+        self._progress_label = apply_type(QLabel("", self._progress_container), "status")
         self._progress_label.setObjectName("progressLabel")
         pc.addWidget(self._progress)
         pc.addWidget(self._progress_label)
         self._progress_container.setVisible(False)
         st.addWidget(self._progress_container)
 
-        self._status_hint = QLabel("", statusbar)
+        self._status_hint = apply_type(QLabel("", statusbar), "status")
         self._status_hint.setObjectName("statusHint")
         st.addWidget(self._status_hint, 1)
 
-        self._received_count = QLabel("", statusbar)
+        self._received_count = apply_type(QLabel("", statusbar), "status")
         self._received_count.setObjectName("receivedCount")
         self._received_count.setVisible(False)
         st.addWidget(self._received_count)
@@ -693,36 +758,54 @@ class AirFloatWindow(QWidget):
         self._send_btn = QPushButton("发送", statusbar)
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._send_btn.setFixedSize(72, 28)
-        self._send_btn.setStyleSheet(
-            "QPushButton#sendBtn { background: %s; color: white; border: none; border-radius: 12px; font-size: 12px; }"
-            "QPushButton#sendBtn:hover { background: #3a80c9; }"
-            "QPushButton#sendBtn:pressed { background: #2f6fb0; }" % PRIMARY
-        )
+        self._send_btn.setFixedSize(SEND_BTN_W, SEND_BTN_H)
+        apply_type(self._send_btn, "button")
         self._send_btn.clicked.connect(self._on_send_clicked)
         st.addWidget(self._send_btn)
 
         root.addWidget(statusbar)
 
         # Toast（浮层）
-        self._toast_label = QLabel("", self)
+        self._toast_label = apply_type(QLabel("", self), "toast")
         self._toast_label.setObjectName("toast")
         self._toast_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._toast_label.setVisible(False)
         self._toast_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._toast_opacity = QGraphicsOpacityEffect(self._toast_label)
+        self._toast_opacity.setOpacity(0.0)
+        self._toast_label.setGraphicsEffect(self._toast_opacity)
+        self._toast_fade = QPropertyAnimation(self._toast_opacity, b"opacity", self)
+        self._toast_fade.setDuration(160 if animations_enabled() else 0)
+        self._toast_fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._toast_fade.finished.connect(self._on_toast_faded)
+        self._toast_rise = QPropertyAnimation(self._toast_label, b"pos", self)
+        self._toast_rise.setDuration(200 if animations_enabled() else 0)
+        self._toast_rise.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
-        self._toast_timer.timeout.connect(lambda: self._toast_label.setVisible(False))
+        self._toast_timer.timeout.connect(self._hide_toast)
 
         # 进度隐藏定时器
         self._progress_timer = QTimer(self)
         self._progress_timer.setSingleShot(True)
-        self._progress_timer.timeout.connect(lambda: self._progress_container.setVisible(False))
+        self._progress_timer.timeout.connect(self._on_progress_hidden)
+
+    def _make_icon_button(self, parent: QWidget, object_name: str, text: str, tip: str) -> QToolButton:
+        """顶栏图标按钮：统一尺寸/光标/字体，避免各处手写。"""
+        btn = QToolButton(parent)
+        btn.setObjectName(object_name)
+        btn.setText(text)
+        btn.setToolTip(tip)
+        btn.setFixedSize(ICON_BTN, ICON_BTN)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFont(type_font("control"))
+        return btn
 
     def _wire_signals(self) -> None:
         self._switch.toggled.connect(self._on_switch_toggled)
         self._device_list.currentItemChanged.connect(self._on_device_current)
         self._folder_btn.clicked.connect(lambda: self.reveal_cache_requested.emit())
+        self._close_btn.clicked.connect(self.close)
         self._image_port.drop_requested.connect(self._on_drop_paths)
         self._image_port.reveal_requested.connect(lambda: self.reveal_cache_requested.emit())
 
@@ -734,7 +817,8 @@ class AirFloatWindow(QWidget):
         self.enabled_changed.emit(bool(checked))
         self._update_status()
 
-    def _on_mode_toggled(self, mode: str, checked: bool) -> None:
+    def _on_mode_toggled(self, mode: str, btn: QPushButton, checked: bool) -> None:
+        self._style_mode_button(btn, checked)
         if not checked or mode not in MODE_LABELS:
             return
         if self._state.get("receiveMode") == mode:
@@ -742,6 +826,11 @@ class AirFloatWindow(QWidget):
         self._state["receiveMode"] = mode
         self.receive_mode_changed.emit(mode)
         self._update_status()
+
+    @staticmethod
+    def _style_mode_button(btn: QPushButton, checked: bool) -> None:
+        """选中行加粗：选中不仅靠颜色，重量也是第二通道。"""
+        btn.setFont(type_font("control", weight=600 if checked else 400))
 
     def _on_device_current(self, current: QListWidgetItem | None, _previous) -> None:
         if self._updating_devices:
@@ -859,8 +948,9 @@ class AirFloatWindow(QWidget):
             return
         if "enabled" in state:
             self._set_enabled_ui(bool(state["enabled"]))
-        if "receiveMode" in state:
-            self._set_mode_ui(str(state["receiveMode"]))
+        mode = state.get("receiveMode", state.get("receive_mode"))
+        if mode:
+            self._set_mode_ui(str(mode))
         if "alias" in state:
             alias = str(state.get("alias") or "")
             self._state["alias"] = alias
@@ -877,17 +967,35 @@ class AirFloatWindow(QWidget):
         pct = round(sent * 100 / total) if total > 0 else 0
         pct = max(0, min(100, pct))
         self._progress.setValue(pct)
-        self._progress_label.setText(f"正在传输 {name} {pct}%")
-        self._progress_container.setVisible(True)
+        # 收窄文案，避免与状态提示在同一行里挤成一团（Apple：标签要简洁）
+        self._progress_label.setText(self._elide(f"{pct}%  {name}", 100, self._progress_label.font()))
+        self._set_progress_visible(True)
         self._progress_timer.stop()
         if pct >= 100:
             self._progress_timer.start(1200)
+
+    def _on_progress_hidden(self) -> None:
+        self._set_progress_visible(False)
+
+    def _set_progress_visible(self, visible: bool) -> None:
+        """进度与状态提示/计数互斥。
+
+        状态栏只有 336px；传输时只留当前最相关的一条信息，避免三样并排挤成一团。
+        """
+        self._progress_container.setVisible(visible)
+        self._status_hint.setVisible(not visible)
+        if visible:
+            self._received_count.setVisible(False)
+        else:
+            self._update_received_count()
 
     def _apply_toast(self, payload) -> None:
         if not isinstance(payload, dict):
             return
         msg = str(payload.get("msg") or "")
         kind = str(payload.get("kind") or "")
+        self._toast_fade.stop()
+        self._toast_rise.stop()
         self._toast_label.setProperty("kind", kind)
         self._toast_label.style().unpolish(self._toast_label)
         self._toast_label.style().polish(self._toast_label)
@@ -896,7 +1004,26 @@ class AirFloatWindow(QWidget):
         self._toast_label.setVisible(True)
         self._toast_label.raise_()
         self._position_toast()
+        # 入场：淡入 + 轻微上浮（Apple：别只是「啪」地出现）
+        end = self._toast_label.pos()
+        self._toast_rise.setStartValue(QPoint(end.x(), end.y() + 8))
+        self._toast_rise.setEndValue(end)
+        self._toast_rise.start()
+        self._toast_fade.setStartValue(self._toast_opacity.opacity())
+        self._toast_fade.setEndValue(1.0)
+        self._toast_fade.start()
         self._toast_timer.start(3200)
+
+    def _hide_toast(self) -> None:
+        """出场：先淡出再隐藏，避免生硬消失。"""
+        self._toast_fade.stop()
+        self._toast_fade.setStartValue(self._toast_opacity.opacity())
+        self._toast_fade.setEndValue(0.0)
+        self._toast_fade.start()
+
+    def _on_toast_faded(self) -> None:
+        if self._toast_opacity.opacity() <= 0.001:
+            self._toast_label.setVisible(False)
 
     def _render_thumbs(self) -> None:
         while self._image_port._grid.count():
@@ -936,7 +1063,8 @@ class AirFloatWindow(QWidget):
         self._switch.blockSignals(True)
         self._switch.setChecked(bool(enabled))
         self._switch.blockSignals(False)
-        self._switch.update()
+        # 同步拇指位置：否则程序化设置的开关会停在「关」，画面与状态不一致
+        self._switch.sync_checked(bool(enabled))
 
     def _set_mode_ui(self, mode: str) -> None:
         if mode not in MODE_LABELS:
@@ -944,19 +1072,36 @@ class AirFloatWindow(QWidget):
         self._state["receiveMode"] = mode
         for btn in self._mode_buttons:
             btn.blockSignals(True)
-            btn.setChecked(btn.property("mode") == mode)
+            checked = btn.property("mode") == mode
+            btn.setChecked(checked)
             btn.blockSignals(False)
+            self._style_mode_button(btn, checked)
 
     def _position_toast(self) -> None:
         lw = self._toast_label.width()
         lh = self._toast_label.height()
-        x = (self.width() - lw) // 2
-        y = self.height() - lh - 46
-        self._toast_label.move(max(8, x), max(8, y))
+        x = GUTTER + (CONTENT_W - lw) // 2
+        y = GUTTER + CONTENT_H - lh - 46
+        self._toast_label.move(max(GUTTER, x), max(GUTTER, y))
+
+    @staticmethod
+    def _elide(text: str, width: int, font) -> str:
+        return QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight, width)
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
         self._position_toast()
+
+    def showEvent(self, e) -> None:  # noqa: N802
+        super().showEvent(e)
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802
+        # 无边框窗口要给出可预期的「出口」（Esc = 关闭）
+        if e.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(e)
 
     # ------------------------------------------------------------------ #
     # 公开 API（供 main.py 调用）
