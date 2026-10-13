@@ -2,8 +2,9 @@
 
 布局（对齐 docs/03）：
 - 顶栏：品牌 + 本机别名 + 打开接收目录按钮（无边框窗口拖拽区）。
-- 左窄栏：隔空投送开关 / 可接收对象三选 / 附近设备列表。
-- 右宽栏「图片口」：缩略图网格 + 空态提示；支持拖入图片发送、拖出缩略图。
+- 外壳：无边框毛玻璃窗口（真实桌面模糊 + 圆角裁剪），八向可缩放，尺寸/位置持久化。
+- 左窄栏（功能键）：隔空投送模块卡片（点圆钮开关 / 点卡片选可接收对象）+ 附近设备列表。
+- 右宽栏「图片口」：缩略图网格（每张带删除键）+ 空态提示；支持拖入图片发送、拖出缩略图。
 - 底部状态栏：进度条 + 状态提示 + 已接收数量。
 
 线程模型：
@@ -17,13 +18,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    Property,
     QEasingCurve,
     QEvent,
     QMimeData,
     QPoint,
     QPropertyAnimation,
+    QRect,
     QRectF,
+    QSettings,
     QSize,
     Qt,
     QTimer,
@@ -31,22 +33,20 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
-    QBrush,
     QColor,
     QDrag,
-    QFont,
     QFontMetrics,
+    QGuiApplication,
     QImageReader,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton,
     QAbstractItemView,
     QApplication,
-    QButtonGroup,
     QFrame,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
@@ -66,26 +66,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .glass import MODE_SOLID, GlassMaterial
+from .glyphs import paint_glyph
 from .styles import (
     ACCENT,
+    ACCENT_ICON,
     BG,
-    CARD,
-    DEFAULT_DEVICE_ICON,
-    DIVIDER,
+    DEFAULT_DEVICE_GLYPH,
+    GLASS_SURFACE,
+    GLASS_SURFACE_HOVER,
+    GLASS_SURFACE_PRESSED,
+    GLASS_TINT_ABGR,
+    HAIRLINE_ALPHA,
+    HIGHLIGHT_ALPHA,
+    MENU_ALPHA,
+    MENU_BG,
     OFFLINE,
     QSS,
     RADIUS_CARD,
     RADIUS_CONTROL,
+    RADIUS_MENU,
+    RADIUS_WINDOW,
     SPACE_1,
     SPACE_2,
     SPACE_3,
-    SPACE_4,
+    SPACE_5,
     TEXT,
     TEXT_SECONDARY,
     animations_enabled,
     apply_type,
-    device_icon,
+    device_glyph,
     type_font,
+    wash,
 )
 
 # HEIC 解码（pillow-heif 注册到 Pillow，兜底 Qt 不支持的格式）
@@ -98,41 +110,51 @@ except Exception:
     _HAS_PILLOW = False
 
 # ---- 常量 ----
-MODE_LABELS = {"everyone": "所有人", "contacts": "仅联系人", "off": "接收关闭"}
-MODE_ORDER = ("everyone", "contacts", "off")
+# 可接收对象：菜单顺序对齐 Apple 隔空投送（关闭 → 仅限联系人 → 所有人）
+MODE_LABELS = {"off": "接收关闭", "contacts": "仅限联系人", "everyone": "所有人"}
+MODE_ORDER = ("off", "contacts", "everyone")
+DEFAULT_MODE = "everyone"
 
-# 内容区按 docs/03 为 360×500；窗口四周再留 GUTTER 给投影，定义「浮窗」的层次。
-CONTENT_W, CONTENT_H = 360, 500
-GUTTER = 12
-WINDOW_W, WINDOW_H = CONTENT_W + 2 * GUTTER, CONTENT_H + 2 * GUTTER
+# 窗口：玻璃就是窗口本身（不再为投影留白），所以没有 GUTTER；
+# 无边框窗口的尺寸完全交给用户，只守住一个下限。
+DEFAULT_WINDOW = (400, 560)
+MIN_WINDOW = (340, 440)
+RESIZE_MARGIN = 6              # 八向缩放热区：无边框窗口的手感全在这几像素上
+SETTINGS_ORG, SETTINGS_APP = "AirFloat", "AirFloatWindow"
+RESIZE_SETTLE_MS = 180         # 停手多久后把亚克力切回来
+
 SIDEBAR_W = 158
-TOPBAR_H = 40
+TOPBAR_H = 44
 STATUSBAR_H = 36
 ICON_BTN = 26
 SEND_BTN_W, SEND_BTN_H = 76, 30
+
+# 隔空投送模块卡片（左侧功能键）
+CARD_W = SIDEBAR_W - 2 * SPACE_3
+CARD_H = 132
+CARD_ICON = 44                 # 圆钮直径
 
 # 缩略图网格
 THUMB_W = 84
 THUMB_IMG_H = 62
 THUMB_NAME_H = 18
 THUMB_CELL_H = THUMB_IMG_H + THUMB_NAME_H
-GRID_COLUMNS = 2
+GRID_COLUMNS = 2               # 初始列数；实际列数随窗口宽度算（见 _sync_columns）
 GRID_GAP = 8
+DELETE_BTN = 20                # 缩略图右上角的删除键
+DELETE_INSET = 4
+
+# 可接收对象弹出菜单
+MENU_W = 196
+MENU_ROW_H = 44
+MENU_PAD = 6
+MENU_SHADOW = 14               # 菜单四周留给投影的透明边
+HOVER_WHITE = 26               # 菜单行悬停底（白色不透明度 / 255）
 
 
 # --------------------------------------------------------------------------- #
 # 工具函数
 # --------------------------------------------------------------------------- #
-def _blend(c1: QColor, c2: QColor, t: float) -> QColor:
-    """线性混合两个颜色，t∈[0,1]。"""
-    t = max(0.0, min(1.0, t))
-    return QColor(
-        round(c1.red() + (c2.red() - c1.red()) * t),
-        round(c1.green() + (c2.green() - c1.green()) * t),
-        round(c1.blue() + (c2.blue() - c1.blue()) * t),
-    )
-
-
 def _center_crop(pm: QPixmap, w: int, h: int) -> QPixmap | None:
     if pm is None or pm.isNull():
         return None
@@ -189,72 +211,67 @@ def _load_thumb(path: str, w: int, h: int) -> QPixmap | None:
 
 
 # --------------------------------------------------------------------------- #
-# 开关（iOS 风格，开=蓝 / 关=灰）
+# 小控件：矢量图标（毛玻璃上不用 emoji —— 彩色 emoji 会显脏、基线也对不齐）
 # --------------------------------------------------------------------------- #
-class ToggleSwitch(QAbstractButton):
-    """无边框圆角开关，带拇指滑动动画。
+class _GlyphButton(QToolButton):
+    """矢量图标按钮：图标由 QPainter 画，颜色随悬停切换。"""
 
-    动效：短促 ease-out（Apple：默认不回弹，只有带惯性的手势才回弹），
-    且从「当前值」起步，因此连点可打断、不跳变；系统关闭动画时直接落终态。
-    """
-
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        glyph: str,
+        tip: str,
+        size: int = ICON_BTN,
+        color: str = "",
+        hover_color: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setCheckable(True)
+        self._glyph = glyph
+        self._color = QColor(color or TEXT)
+        self._hover_color = QColor(hover_color) if hover_color else None
+        self._hover = False
+        self.setToolTip(tip)
+        self.setFixedSize(size, size)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(44, 26)
-        self._offset = 0.0
-        self._anim = QPropertyAnimation(self, b"offset", self)
-        self._anim.setDuration(150 if animations_enabled() else 0)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.toggled.connect(self._on_toggled)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
-    # -- 动画属性 --
-    def _get_offset(self) -> float:
-        return self._offset
-
-    def _set_offset(self, v: float) -> None:
-        self._offset = v
+    def enterEvent(self, e) -> None:  # noqa: N802
+        self._hover = True
         self.update()
+        super().enterEvent(e)
 
-    offset = Property(float, _get_offset, _set_offset)
-
-    def sync_checked(self, checked: bool) -> None:
-        """程序化同步状态：直接落到终态，不播动画，保证画面与逻辑状态一致。"""
-        self._anim.stop()
-        self._set_offset(1.0 if checked else 0.0)
-
-    def _on_toggled(self, checked: bool) -> None:
-        self._anim.stop()
-        self._anim.setStartValue(self._offset)
-        self._anim.setEndValue(1.0 if checked else 0.0)
-        self._anim.start()
-
-    def sizeHint(self) -> QSize:  # noqa: D102
-        return QSize(44, 26)
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
 
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-
-        track = _blend(QColor(OFFLINE), QColor(ACCENT), self._offset)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(track))
-        p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
-
-        margin = 2.0
-        travel = float(w - h)
-        x = margin + self._offset * travel
-        d = h - 2 * margin
-        p.setBrush(QBrush(QColor("#FFFFFF")))
-        p.drawEllipse(QRectF(x, margin, d, d))
-
-        # 无障碍：自绘控件没有默认焦点环，键盘焦点必须可见
+        color = self._hover_color if (self._hover and self._hover_color is not None) else self._color
+        paint_glyph(p, self._glyph, self.rect(), color)
         if self.hasFocus():
-            p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor(ACCENT), 2))
-            p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), (h - 2) / 2, (h - 2) / 2)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(
+                QRectF(1, 1, self.width() - 2, self.height() - 2), RADIUS_CONTROL - 2, RADIUS_CONTROL - 2
+            )
+        p.end()
+
+
+class _GlyphLabel(QWidget):
+    """空态里的大图标：矢量绘制，任意尺寸都不糊。"""
+
+    def __init__(self, glyph: str, size: int, color: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._glyph = glyph
+        self._color = QColor(color)
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        paint_glyph(p, self._glyph, self.rect(), self._color)
         p.end()
 
 
@@ -280,20 +297,16 @@ class DeviceItemDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
         elif hovered:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(BG))
+            painter.setBrush(wash(0.06))
             painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
 
         alias = index.data(Qt.ItemDataRole.UserRole) or index.text() or "未知设备"
         dtype = index.data(Qt.ItemDataRole.UserRole + 1) or ""
-        emoji = index.data(Qt.ItemDataRole.UserRole + 2) or DEFAULT_DEVICE_ICON
+        glyph = index.data(Qt.ItemDataRole.UserRole + 2) or DEFAULT_DEVICE_GLYPH
 
-        x = rect.left() + 8
-        icon_rect = QRectF(x, rect.top() + rect.height() / 2 - 11, 22, 22)
-        f_icon = QFont("Segoe UI Emoji")
-        f_icon.setPixelSize(13)
-        painter.setFont(f_icon)
-        painter.setPen(QColor("#FFFFFF" if selected else TEXT))
-        painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, emoji)
+        x = rect.left() + 7
+        icon_rect = QRectF(x, rect.top() + rect.height() / 2 - 10, 20, 20)
+        paint_glyph(painter, glyph, icon_rect, QColor("#FFFFFF" if selected else TEXT))
 
         text_x = icon_rect.right() + 7
         right = rect.right() - 6
@@ -323,7 +336,9 @@ class DeviceItemDelegate(QStyledItemDelegate):
 # 缩略图（可拖出）
 # --------------------------------------------------------------------------- #
 class ThumbWidget(QWidget):
-    """接收到的单张图片缩略图；按住拖出浮窗触发系统级文件拖拽。"""
+    """接收到的单张图片缩略图：右上角有删除键；按住拖出浮窗触发系统级文件拖拽。"""
+
+    delete_requested = Signal()
 
     def __init__(self, file_path: str, file_name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -336,6 +351,15 @@ class ThumbWidget(QWidget):
         self._pixmap = _load_thumb(self._file_path, THUMB_W, THUMB_IMG_H)
         self._press_pos: QPoint | None = None
 
+        # 删除键：常显（照片上的删除键要一眼看见），悬停变错误色
+        self._delete_btn = _GlyphButton(
+            "close", "移除这张图", size=DELETE_BTN, color="#FFFFFF", hover_color="#FFFFFF", parent=self
+        )
+        self._delete_btn.setObjectName("thumbDelete")
+        self._delete_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._delete_btn.clicked.connect(self.delete_requested.emit)
+        self._delete_btn.move(THUMB_W - DELETE_BTN - DELETE_INSET, DELETE_INSET)
+
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -346,20 +370,22 @@ class ThumbWidget(QWidget):
         path.addRoundedRect(card, RADIUS_CARD, RADIUS_CARD)
         p.setClipPath(path)
 
-        p.setPen(QPen(QColor(DIVIDER), 1))
-        p.setBrush(QColor(CARD))
+        p.setPen(QPen(wash(HAIRLINE_ALPHA), 1))
+        p.setBrush(QColor(255, 255, 255, round(GLASS_SURFACE * 255)))
         p.drawRoundedRect(card, RADIUS_CARD, RADIUS_CARD)
 
         img_rect = QRectF(1, 1, w - 2, THUMB_IMG_H - 2)
         if self._pixmap is not None:
             p.drawPixmap(img_rect.toRect(), self._pixmap)
         else:
-            p.fillRect(img_rect, QColor(BG))
-            p.setPen(QColor(TEXT_SECONDARY))
-            f_ph = QFont("Segoe UI Emoji")
-            f_ph.setPixelSize(18)
-            p.setFont(f_ph)
-            p.drawText(img_rect, Qt.AlignmentFlag.AlignCenter, "🖼️")
+            p.fillRect(img_rect, wash(0.06))
+            side = 24.0
+            paint_glyph(
+                p,
+                "image",
+                QRectF(img_rect.center().x() - side / 2, img_rect.center().y() - side / 2, side, side),
+                QColor(TEXT_SECONDARY),
+            )
 
         p.setPen(QColor(TEXT_SECONDARY))
         f = type_font("caption")
@@ -418,9 +444,7 @@ class ImagePort(QFrame):
         ev = QVBoxLayout(self._empty_state)
         ev.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev.setSpacing(SPACE_2)
-        icon = apply_type(QLabel("🖼️", self._empty_state), "emptyIcon")
-        icon.setObjectName("emptyIcon")
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon = _GlyphLabel("image", 44, TEXT_SECONDARY, self._empty_state)
         main = apply_type(QLabel("手机发来的图会出现在这里", self._empty_state), "emptyTitle")
         main.setObjectName("emptyMain")
         main.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -522,7 +546,404 @@ class ImagePort(QFrame):
 
 
 # --------------------------------------------------------------------------- #
-# 顶栏（无边框窗口拖拽区 + 打开接收目录）
+# 隔空投送模块卡片（左侧功能键）：点圆钮开关，点卡片选可接收对象
+# --------------------------------------------------------------------------- #
+class AirdropCard(QWidget):
+    """对齐 Apple 隔空投送模块：圆钮 + 标题 + 取值行（所有人 ⌄），整卡可点。
+
+    两个热区各司其职（与系统隔空投送一致）：左上圆钮 = 开 / 关，
+    其余区域 = 展开「可接收对象」菜单；两者都有 tooltip 交代，不必猜。
+    """
+
+    toggle_requested = Signal()
+    menu_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(CARD_W, CARD_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setToolTip("点圆钮开 / 关隔空投送；点卡片选择可接收对象")
+
+        self._enabled = False
+        self._hover = False
+        self._pressed = False
+        self._icon_hover = False
+        self._icon_pressed = False
+
+        self._title = apply_type(QLabel("隔空投送", self), "cardTitle")
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._value_label = apply_type(QLabel(MODE_LABELS["off"], self), "cardValue")
+        self._value_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._place_text()
+
+    # -- 状态（真相永远在 AirFloatWindow._state，本控件只负责显示）--
+
+    def set_state(self, enabled: bool, value: str) -> None:
+        self._enabled = bool(enabled)
+        if self._value_label.text() != value:
+            self._value_label.setText(value)
+            self._value_label.adjustSize()
+        self._place_text()
+        self.update()
+
+    # -- 几何 --
+
+    def _icon_rect(self) -> QRectF:
+        return QRectF(SPACE_3 + 2, SPACE_3 + 2, CARD_ICON, CARD_ICON)
+
+    def _place_text(self) -> None:
+        left = SPACE_3 + 2
+        self._title.adjustSize()
+        self._value_label.adjustSize()
+        self._value_label.move(left, CARD_H - SPACE_3 - self._value_label.height())
+        self._title.move(left, self._value_label.y() - self._title.height() - 1)
+
+    # -- 绘制 --
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+
+        # 浅材质面：结构分区（侧栏）比它重，所以这里叠白是「更靠近手指」，不是叠浅材质
+        if self._pressed and not self._icon_pressed:
+            alpha = GLASS_SURFACE_PRESSED          # 按下就变，不等抬起
+        elif self._hover:
+            alpha = GLASS_SURFACE_HOVER
+        else:
+            alpha = GLASS_SURFACE
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, round(alpha * 255)))
+        p.drawRoundedRect(rect, RADIUS_CARD, RADIUS_CARD)
+
+        # 顶边受光：浅材质也要有厚度，否则像一张贴纸
+        rim = QLinearGradient(0.0, 0.0, 0.0, rect.height())
+        rim.setColorAt(0.0, QColor(255, 255, 255, round(255 * HIGHLIGHT_ALPHA)))
+        rim.setColorAt(0.5, QColor(255, 255, 255, 46))
+        rim.setColorAt(1.0, QColor(255, 255, 255, 26))
+        pen = QPen()
+        pen.setBrush(rim)
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, RADIUS_CARD, RADIUS_CARD)
+
+        # 圆钮：开 = 强调蓝（其上白色字形 5.46:1），关 = 中性灰（4.82:1）
+        icon = self._icon_rect()
+        fill = QColor(ACCENT_ICON if self._enabled else OFFLINE)
+        if self._icon_pressed:
+            fill = fill.darker(112)
+        elif self._icon_hover:
+            fill = fill.lighter(110)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawEllipse(icon)
+        paint_glyph(p, "airdrop", icon.adjusted(SPACE_3, SPACE_3, -SPACE_3, -SPACE_3), QColor("#FFFFFF"))
+
+        # 取值行尾的展开提示
+        geo = self._value_label.geometry()
+        paint_glyph(
+            p,
+            "chevron",
+            QRectF(geo.right() + SPACE_1, geo.top(), 12, max(12, geo.height())),
+            QColor(TEXT_SECONDARY),
+        )
+
+        # 自绘控件默认没有焦点环，键盘焦点必须可见
+        if self.hasFocus():
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), RADIUS_CARD - 1, RADIUS_CARD - 1)
+        p.end()
+
+    # -- 交互 --
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        self._icon_pressed = self._icon_rect().contains(e.position())
+        self._pressed = True
+        self.update()
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        on_icon = self._icon_pressed
+        self._pressed = False
+        self._icon_pressed = False
+        self.update()
+        if e.button() != Qt.MouseButton.LeftButton or not self.rect().contains(e.position().toPoint()):
+            return
+        if not on_icon:
+            self.menu_requested.emit()
+        elif self._icon_rect().contains(e.position()):
+            self.toggle_requested.emit()
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        inside = self._icon_rect().contains(e.position())
+        if inside != self._icon_hover:
+            self._icon_hover = inside
+            self.update()
+
+    def enterEvent(self, e) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        self._hover = False
+        self._pressed = False
+        self._icon_pressed = False
+        self._icon_hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.menu_requested.emit()
+            return
+        super().keyPressEvent(e)
+
+
+# --------------------------------------------------------------------------- #
+# 可接收对象弹出菜单（深色材质 + 勾选行）
+# --------------------------------------------------------------------------- #
+class _MenuPanel(QFrame):
+    """菜单底板：深色材质 + 顶边受光。"""
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        bg = QColor(MENU_BG)
+        bg.setAlphaF(MENU_ALPHA)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(rect, RADIUS_MENU, RADIUS_MENU)
+
+        rim = QLinearGradient(0.0, 0.0, 0.0, rect.height())
+        rim.setColorAt(0.0, QColor(255, 255, 255, 58))
+        rim.setColorAt(0.4, QColor(255, 255, 255, 20))
+        rim.setColorAt(1.0, QColor(255, 255, 255, 14))
+        pen = QPen()
+        pen.setBrush(rim)
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, RADIUS_MENU, RADIUS_MENU)
+        p.end()
+
+
+class _ModeRow(QWidget):
+    """菜单行：勾选列 + 文字；悬停 / 按下 / 选中三态各自可见。"""
+
+    chosen = Signal(str)
+
+    def __init__(self, mode: str, label: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._mode = mode
+        self._selected = False
+        self._hover = False
+        self._pressed = False
+        self.setFixedHeight(MENU_ROW_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setMouseTracking(True)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(SPACE_3, 0, SPACE_3, 0)
+        lay.setSpacing(SPACE_3)
+        self._label = apply_type(QLabel(label, self), "menuRow")
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lay.addSpacing(16)            # 勾选列：选中行才画勾，文字位置不动
+        lay.addWidget(self._label)
+        lay.addStretch(1)
+        self._apply_text_style()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = bool(selected)
+        self._apply_text_style()
+        self.update()
+
+    def _apply_text_style(self) -> None:
+        color = "rgba(255, 255, 255, 255)" if self._selected else "rgba(255, 255, 255, 226)"
+        self._label.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        if self._hover or self._pressed:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 46 if self._pressed else HOVER_WHITE))
+            p.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
+        if self._selected:
+            paint_glyph(
+                p, "check", QRectF(SPACE_3 - 1, (self.height() - 13) / 2.0, 13, 13), QColor("#FFFFFF")
+            )
+        if self.hasFocus():
+            p.setPen(QPen(QColor(255, 255, 255, 150), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
+        p.end()
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self.update()
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        pressed = self._pressed
+        self._pressed = False
+        self.update()
+        if pressed and e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.chosen.emit(self._mode)
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        inside = self.rect().contains(e.position().toPoint())
+        if inside != self._hover:
+            self._hover = inside
+            self.update()
+
+    def enterEvent(self, e) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        self._hover = False
+        self._pressed = False
+        self.update()
+        super().leaveEvent(e)
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.chosen.emit(self._mode)
+            return
+        super().keyPressEvent(e)
+
+
+class _ModePopup(QWidget):
+    """可接收对象菜单：锚在触发它的卡片下方（菜单从来源处「长出来」）。"""
+
+    mode_chosen = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self._current = MODE_ORDER[0]
+        self._panel = _MenuPanel(self)
+        shadow = QGraphicsDropShadowEffect(self._panel)
+        shadow.setBlurRadius(22)
+        shadow.setOffset(0, 7)
+        shadow.setColor(QColor(12, 14, 18, 85))
+        self._panel.setGraphicsEffect(shadow)
+
+        inner = QVBoxLayout(self._panel)
+        inner.setContentsMargins(MENU_PAD, MENU_PAD, MENU_PAD, MENU_PAD)
+        inner.setSpacing(0)
+        self._rows: dict[str, _ModeRow] = {}
+        for mode in MODE_ORDER:
+            row = _ModeRow(mode, MODE_LABELS[mode], self._panel)
+            row.chosen.connect(self._on_chosen)
+            self._rows[mode] = row
+            inner.addWidget(row)
+        self._panel.setFixedWidth(MENU_W)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(MENU_SHADOW, MENU_SHADOW, MENU_SHADOW, MENU_SHADOW)
+        outer.setSpacing(0)
+        outer.addWidget(self._panel)
+
+        # 出现时「材质化」而不是硬切：淡入 + 自上而下 6px 长出
+        duration = 150 if animations_enabled() else 0
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(duration)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._rise = QPropertyAnimation(self, b"pos", self)
+        self._rise.setDuration(duration)
+        self._rise.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    @property
+    def rows(self) -> dict:
+        return self._rows
+
+    def _on_chosen(self, mode: str) -> None:
+        self.mode_chosen.emit(mode)
+        self.close()
+
+    def popup_at(self, anchor: QPoint, current: str) -> None:
+        """anchor = 卡片左下角的全局坐标。放不下就翻到卡片上方，并让出屏幕边。"""
+        self._current = current
+        for mode, row in self._rows.items():
+            row.set_selected(mode == current)
+        self.adjustSize()
+        target = QPoint(anchor.x() - MENU_SHADOW - SPACE_1, anchor.y() - MENU_SHADOW)
+        screen = QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            if target.x() + self.width() > area.right() + 1:
+                target.setX(area.right() + 1 - self.width())
+            if target.y() + self.height() > area.bottom() + 1:
+                target.setY(anchor.y() - self.height() + MENU_SHADOW + SPACE_1)
+            target.setX(max(area.left(), target.x()))
+            target.setY(max(area.top(), target.y()))
+        self.move(target)
+        self.show()
+        self.raise_()
+        if animations_enabled():
+            self.setWindowOpacity(0.0)
+            self._fade.stop()
+            self._fade.setStartValue(0.0)
+            self._fade.setEndValue(1.0)
+            self._fade.start()
+            self._rise.stop()
+            self._rise.setStartValue(QPoint(target.x(), target.y() - 6))
+            self._rise.setEndValue(target)
+            self._rise.start()
+        else:
+            self.setWindowOpacity(1.0)
+        # 焦点交给菜单本身：打开时不高亮任何一行（否则选中行会多一圈焦点环）。
+        # 用方向键浏览时才逐行给焦点，键盘可见性照旧。
+        self.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        # 投影留白是透明的：点在留白上应当关掉菜单，而不是被吞掉
+        if not self._panel.geometry().contains(e.position().toPoint()):
+            self.close()
+            return
+        super().mousePressEvent(e)
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802
+        if e.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            focused = next((row for row in self._rows.values() if row.hasFocus()), None)
+            if focused is not None:
+                focused.chosen.emit(focused._mode)
+            else:
+                self._on_chosen(self._current)
+            return
+        if e.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            order = list(self._rows.values())
+            if order:
+                focused = next((i for i, row in enumerate(order) if row.hasFocus()), None)
+                step = -1 if e.key() == Qt.Key.Key_Up else 1
+                index = 0 if focused is None else (focused + step) % len(order)
+                order[index].setFocus(Qt.FocusReason.TabFocusReason)
+            return
+        super().keyPressEvent(e)
+
+
+# --------------------------------------------------------------------------- #
+# 顶栏（无边框窗口拖拽区 + 打开接收目录 + 关闭）
 # --------------------------------------------------------------------------- #
 class TopBar(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -530,15 +951,29 @@ class TopBar(QFrame):
         self.setObjectName("topbar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(TOPBAR_H)
+        self.setMouseTracking(True)
 
     def mousePressEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            if isinstance(window, AirFloatWindow):
+                # 上边缘也要能缩放：先给缩放热区一次机会，再退回「拖动窗口」
+                local = self.mapTo(window, e.position().toPoint())
+                if window._try_resize_at(local, e.globalPosition().toPoint()):
+                    e.accept()
+                    return
             handle = self.window().windowHandle()
             if handle is not None:
                 handle.startSystemMove()
                 e.accept()
                 return
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        window = self.window()
+        if isinstance(window, AirFloatWindow):
+            window._update_resize_cursor(self.mapTo(window, e.position().toPoint()))
+        super().mouseMoveEvent(e)
 
 
 # --------------------------------------------------------------------------- #
@@ -568,10 +1003,22 @@ class AirFloatWindow(QWidget):
         self.setWindowTitle("AirFloat")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(WINDOW_W, WINDOW_H)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(QSize(*MIN_WINDOW))
+        self.resize(QSize(*DEFAULT_WINDOW))
         self.setStyleSheet(QSS)
         # 让窗口自身可持有焦点：启动时焦点环不落在某个次要按钮上（键盘 Tab 时仍可见）
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # -- 材质 / 几何 --
+        self._material = GlassMaterial()
+        self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self._glass_ready = False
+        self._resize_session: dict | None = None
+        self._resize_settle = QTimer(self)
+        self._resize_settle.setSingleShot(True)
+        self._resize_settle.timeout.connect(self._material.resume)
 
         # -- 状态 --
         self._protocol = None
@@ -599,19 +1046,14 @@ class AirFloatWindow(QWidget):
     # 构建 UI
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
+        # 玻璃铺满整窗：不再留 GUTTER 画投影（投影留白会挡住背后的模糊）
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(GUTTER, GUTTER, GUTTER, GUTTER)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # 窗口主体：承载投影，给「浮窗」以深度（Apple：浮动层需要层次）
         self._body = QFrame(self)
         self._body.setObjectName("windowBody")
         self._body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        shadow = QGraphicsDropShadowEffect(self._body)
-        shadow.setBlurRadius(26)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QColor(31, 45, 61, 70))
-        self._body.setGraphicsEffect(shadow)
         outer.addWidget(self._body)
 
         root = QVBoxLayout(self._body)
@@ -628,8 +1070,12 @@ class AirFloatWindow(QWidget):
         self._self_alias_label = apply_type(QLabel("", topbar), "alias")
         self._self_alias_label.setObjectName("selfAlias")
         self._self_alias_label.setVisible(False)
-        self._folder_btn = self._make_icon_button(topbar, "folderBtn", "📁", "打开接收目录")
-        self._close_btn = self._make_icon_button(topbar, "closeBtn", "✕", "关闭窗口")
+        self._folder_btn = _GlyphButton("folder", "打开接收目录", parent=topbar)
+        self._folder_btn.setObjectName("folderBtn")
+        self._close_btn = _GlyphButton(
+            "close", "关闭窗口", color=TEXT, hover_color="#FFFFFF", parent=topbar
+        )
+        self._close_btn.setObjectName("closeBtn")
         tb.addWidget(brand)
         tb.addWidget(self._self_alias_label)
         tb.addStretch(1)
@@ -648,49 +1094,15 @@ class AirFloatWindow(QWidget):
         sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         sidebar.setFixedWidth(SIDEBAR_W)
         sb = QVBoxLayout(sidebar)
-        sb.setContentsMargins(SPACE_3, SPACE_3 + 2, SPACE_3, SPACE_3)
+        sb.setContentsMargins(SPACE_3, SPACE_3, SPACE_3, SPACE_3)
         sb.setSpacing(0)
 
-        # ① 隔空投送开关
-        switch_row = QHBoxLayout()
-        switch_row.setContentsMargins(0, 0, 0, 0)
-        switch_row.setSpacing(SPACE_2)
-        switch_label = apply_type(QLabel("隔空投送", sidebar), "rowLabel")
-        switch_label.setObjectName("rowLabel")
-        self._switch = ToggleSwitch(sidebar)
-        switch_row.addWidget(switch_label)
-        switch_row.addStretch(1)
-        switch_row.addWidget(self._switch)
-        sb.addLayout(switch_row)
-        sb.addSpacing(SPACE_4)
+        # ① 隔空投送模块卡片：开关与「可接收对象」合到一处（对齐 Apple 隔空投送模块）
+        self._card = AirdropCard(sidebar)
+        sb.addWidget(self._card, 0, Qt.AlignmentFlag.AlignLeft)
+        sb.addSpacing(SPACE_5)
 
-        # ② 可接收对象（组内紧凑、组间拉开：用邻近性表达从属关系）
-        group_title = apply_type(QLabel("可接收对象", sidebar), "groupTitle")
-        group_title.setObjectName("groupTitle")
-        sb.addWidget(group_title)
-        sb.addSpacing(SPACE_1)
-
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.setExclusive(True)
-        self._mode_buttons: list[QPushButton] = []
-        mode_box = QVBoxLayout()
-        mode_box.setContentsMargins(0, 0, 0, 0)
-        mode_box.setSpacing(2)
-        for mode in MODE_ORDER:
-            btn = QPushButton(MODE_LABELS[mode], sidebar)
-            btn.setObjectName("modeOption")
-            btn.setCheckable(True)
-            btn.setProperty("mode", mode)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            apply_type(btn, "control")
-            btn.toggled.connect(lambda checked, m=mode, b=btn: self._on_mode_toggled(m, b, checked))
-            self._mode_group.addButton(btn)
-            self._mode_buttons.append(btn)
-            mode_box.addWidget(btn)
-        sb.addLayout(mode_box)
-        sb.addSpacing(SPACE_4)
-
-        # ③ 附近设备
+        # ② 附近设备
         dev_title = apply_type(QLabel("附近设备", sidebar), "groupTitle")
         dev_title.setObjectName("groupTitle")
         sb.addWidget(dev_title)
@@ -785,24 +1197,18 @@ class AirFloatWindow(QWidget):
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self._hide_toast)
 
+        # 可接收对象菜单：Qt.Popup 自己处理「点外面 / Esc 关闭」，不必额外转发事件
+        self._menu = _ModePopup(self)
+
         # 进度隐藏定时器
         self._progress_timer = QTimer(self)
         self._progress_timer.setSingleShot(True)
         self._progress_timer.timeout.connect(self._on_progress_hidden)
 
-    def _make_icon_button(self, parent: QWidget, object_name: str, text: str, tip: str) -> QToolButton:
-        """顶栏图标按钮：统一尺寸/光标/字体，避免各处手写。"""
-        btn = QToolButton(parent)
-        btn.setObjectName(object_name)
-        btn.setText(text)
-        btn.setToolTip(tip)
-        btn.setFixedSize(ICON_BTN, ICON_BTN)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFont(type_font("control"))
-        return btn
-
     def _wire_signals(self) -> None:
-        self._switch.toggled.connect(self._on_switch_toggled)
+        self._card.toggle_requested.connect(self._toggle_enabled)
+        self._card.menu_requested.connect(self._open_mode_menu)
+        self._menu.mode_chosen.connect(self._on_mode_chosen)
         self._device_list.currentItemChanged.connect(self._on_device_current)
         self._folder_btn.clicked.connect(lambda: self.reveal_cache_requested.emit())
         self._close_btn.clicked.connect(self.close)
@@ -812,25 +1218,46 @@ class AirFloatWindow(QWidget):
     # ------------------------------------------------------------------ #
     # 内部事件
     # ------------------------------------------------------------------ #
-    def _on_switch_toggled(self, checked: bool) -> None:
-        self._state["enabled"] = bool(checked)
-        self.enabled_changed.emit(bool(checked))
+    # -- 隔空投送模块：开关 / 可接收对象 --
+
+    def _display_mode(self) -> str:
+        """当前要展示的取值：关掉隔空投送就等于「接收关闭」。"""
+        if not self._state.get("enabled"):
+            return "off"
+        mode = self._state.get("receiveMode") or DEFAULT_MODE
+        return mode if mode in MODE_LABELS else DEFAULT_MODE
+
+    def _sync_card(self) -> None:
+        self._card.set_state(bool(self._state.get("enabled")), MODE_LABELS[self._display_mode()])
+
+    def _toggle_enabled(self) -> None:
+        """圆钮：开 / 关。关掉不改动 receiveMode，再打开就回到上次的选择（与系统一致）。"""
+        enabled = not self._state.get("enabled")
+        self._state["enabled"] = enabled
+        self.enabled_changed.emit(enabled)
+        self._sync_card()
         self._update_status()
 
-    def _on_mode_toggled(self, mode: str, btn: QPushButton, checked: bool) -> None:
-        self._style_mode_button(btn, checked)
-        if not checked or mode not in MODE_LABELS:
-            return
-        if self._state.get("receiveMode") == mode:
-            return
-        self._state["receiveMode"] = mode
-        self.receive_mode_changed.emit(mode)
-        self._update_status()
+    def _open_mode_menu(self) -> None:
+        anchor = self._card.mapToGlobal(QPoint(0, self._card.height()))
+        self._menu.popup_at(anchor, self._display_mode())
 
-    @staticmethod
-    def _style_mode_button(btn: QPushButton, checked: bool) -> None:
-        """选中行加粗：选中不仅靠颜色，重量也是第二通道。"""
-        btn.setFont(type_font("control", weight=600 if checked else 400))
+    def _on_mode_chosen(self, mode: str) -> None:
+        if mode not in MODE_LABELS:
+            return
+        if mode == "off":
+            if self._state.get("enabled"):
+                self._state["enabled"] = False
+                self.enabled_changed.emit(False)
+        else:
+            if not self._state.get("enabled"):
+                self._state["enabled"] = True
+                self.enabled_changed.emit(True)
+            if self._state.get("receiveMode") != mode:
+                self._state["receiveMode"] = mode
+                self.receive_mode_changed.emit(mode)
+        self._sync_card()
+        self._update_status()
 
     def _on_device_current(self, current: QListWidgetItem | None, _previous) -> None:
         if self._updating_devices:
@@ -908,7 +1335,7 @@ class AirFloatWindow(QWidget):
                 it.setText(alias)
                 it.setData(Qt.ItemDataRole.UserRole, alias)
                 it.setData(Qt.ItemDataRole.UserRole + 1, dtype)
-                it.setData(Qt.ItemDataRole.UserRole + 2, device_icon(dtype))
+                it.setData(Qt.ItemDataRole.UserRole + 2, device_glyph(dtype))
                 it.setData(Qt.ItemDataRole.UserRole + 3, fp)
                 it.setToolTip(f"{alias} · {dtype}")
                 lst.addItem(it)
@@ -1039,8 +1466,33 @@ class AirFloatWindow(QWidget):
             path = item.get("file_path") or item.get("filePath") or ""
             name = item.get("file_name") or item.get("fileName") or ""
             tw = ThumbWidget(path, name)
+            tw.delete_requested.connect(lambda item=item: self._remove_item(item))
             r, c = divmod(idx, self._image_port._columns)
             self._image_port._grid.addWidget(tw, r, c)
+
+    def _remove_item(self, item: dict) -> None:
+        """删除键：只把这张从列表里拿掉，不动磁盘上的文件（不替用户决定删文件）。"""
+        for index, candidate in enumerate(self._received_items):
+            if candidate is item:
+                del self._received_items[index]
+                break
+        else:
+            return
+        path = item.get("file_path") or item.get("filePath") or ""
+        if path in self._pending_send:
+            self._pending_send.remove(path)
+        name = item.get("file_name") or item.get("fileName") or "图片"
+        self._render_thumbs()
+        self._update_received_count()
+        self.show_toast(f"已移除：{name}")
+
+    def _sync_columns(self) -> None:
+        """列数跟着窗口宽度走：放大就多排几张，缩回去也不会溢出。"""
+        port_w = max(0, self.width() - SIDEBAR_W)
+        columns = max(1, (port_w - 2 * SPACE_2 - 8 + GRID_GAP) // (THUMB_W + GRID_GAP))
+        if columns != self._image_port._columns:
+            self._image_port._columns = int(columns)
+            self._render_thumbs()
 
     def _update_received_count(self) -> None:
         n = len(self._received_items)
@@ -1060,29 +1512,21 @@ class AirFloatWindow(QWidget):
 
     def _set_enabled_ui(self, enabled: bool) -> None:
         self._state["enabled"] = bool(enabled)
-        self._switch.blockSignals(True)
-        self._switch.setChecked(bool(enabled))
-        self._switch.blockSignals(False)
-        # 同步拇指位置：否则程序化设置的开关会停在「关」，画面与状态不一致
-        self._switch.sync_checked(bool(enabled))
+        self._sync_card()
 
     def _set_mode_ui(self, mode: str) -> None:
         if mode not in MODE_LABELS:
             return
         self._state["receiveMode"] = mode
-        for btn in self._mode_buttons:
-            btn.blockSignals(True)
-            checked = btn.property("mode") == mode
-            btn.setChecked(checked)
-            btn.blockSignals(False)
-            self._style_mode_button(btn, checked)
+        self._sync_card()
 
     def _position_toast(self) -> None:
+        # 窗口可缩放：Toast 按当前尺寸居中，不再依赖固定常数
         lw = self._toast_label.width()
         lh = self._toast_label.height()
-        x = GUTTER + (CONTENT_W - lw) // 2
-        y = GUTTER + CONTENT_H - lh - 46
-        self._toast_label.move(max(GUTTER, x), max(GUTTER, y))
+        x = (self.width() - lw) // 2
+        y = self.height() - lh - STATUSBAR_H - SPACE_3
+        self._toast_label.move(max(0, x), max(0, y))
 
     @staticmethod
     def _elide(text: str, width: int, font) -> str:
@@ -1090,11 +1534,192 @@ class AirFloatWindow(QWidget):
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
+        self._update_region()
         self._position_toast()
+        self._sync_columns()
+        if self._resize_session is not None:
+            self._material.suspend()
+            self._resize_settle.start(RESIZE_SETTLE_MS)
+
+    def changeEvent(self, e) -> None:  # noqa: N802
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange:
+            QTimer.singleShot(0, self._update_region)
 
     def showEvent(self, e) -> None:  # noqa: N802
         super().showEvent(e)
+        if not self._glass_ready:
+            self._glass_ready = True
+            # 窗口句柄要 show 之后才成立：材质与圆角裁剪都挂在这一刻
+            self._material.attach(int(self.winId()), GLASS_TINT_ABGR)
+            self._restore_geometry()
+            self._update_region()
         self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def closeEvent(self, e) -> None:  # noqa: N802
+        try:
+            self._settings.setValue("geometry", self.saveGeometry())
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+    # ------------------------------------------------------------------ #
+    # 材质 / 几何（毛玻璃 + 无边框缩放）
+    # ------------------------------------------------------------------ #
+    def _restore_geometry(self) -> None:
+        stored = self._settings.value("geometry")
+        if stored is not None:
+            self.restoreGeometry(stored)
+            return
+        self.resize(QSize(*DEFAULT_WINDOW))
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            self.move(area.center() - QPoint(self.width() // 2, area.height() // 3))
+
+    def _update_region(self) -> None:
+        """圆角靠窗口区域裁剪：亚克力模糊是矩形，不裁四角会露出方块。"""
+        if not self._glass_ready:
+            return
+        self._material.set_rounded(
+            self.width(),
+            self.height(),
+            RADIUS_WINDOW,
+            self.devicePixelRatioF(),
+            enabled=not self.isMaximized(),
+        )
+
+    def _edges_at(self, pos: QPoint):
+        margin = RESIZE_MARGIN
+        edges = None
+        if pos.x() <= margin:
+            edges = Qt.Edge.LeftEdge
+        elif pos.x() >= self.width() - margin:
+            edges = Qt.Edge.RightEdge
+        if pos.y() <= margin:
+            edges = Qt.Edge.TopEdge if edges is None else edges | Qt.Edge.TopEdge
+        elif pos.y() >= self.height() - margin:
+            edges = Qt.Edge.BottomEdge if edges is None else edges | Qt.Edge.BottomEdge
+        return edges
+
+    @staticmethod
+    def _cursor_for(edges):
+        left = bool(edges & Qt.Edge.LeftEdge)
+        right = bool(edges & Qt.Edge.RightEdge)
+        top = bool(edges & Qt.Edge.TopEdge)
+        bottom = bool(edges & Qt.Edge.BottomEdge)
+        if (left and top) or (right and bottom):
+            return Qt.CursorShape.SizeFDiagCursor
+        if (right and top) or (left and bottom):
+            return Qt.CursorShape.SizeBDiagCursor
+        if left or right:
+            return Qt.CursorShape.SizeHorCursor
+        return Qt.CursorShape.SizeVerCursor
+
+    def _update_resize_cursor(self, pos: QPoint) -> None:
+        edges = None if self.isMaximized() else self._edges_at(pos)
+        if edges:
+            self.setCursor(self._cursor_for(edges))
+        else:
+            self.unsetCursor()
+
+    def _try_resize_at(self, pos: QPoint, global_pos: QPoint) -> bool:
+        """命中缩放热区就走系统缩放（原生手感）；系统不支持时退回手动缩放。"""
+        if self.isMaximized():
+            return False
+        edges = self._edges_at(pos)
+        if not edges:
+            return False
+        handle = self.windowHandle()
+        if handle is not None and handle.startSystemResize(edges):
+            self._material.suspend()
+            self._resize_settle.start(RESIZE_SETTLE_MS)
+            return True
+        self._resize_session = {"edges": edges, "origin": global_pos, "geometry": QRect(self.geometry())}
+        self._material.suspend()
+        self.setCursor(self._cursor_for(edges))
+        return True
+
+    def _apply_manual_resize(self, global_pos: QPoint) -> None:
+        session = self._resize_session
+        edges = session["edges"]
+        delta = global_pos - session["origin"]
+        rect = QRect(session["geometry"])
+        min_w, min_h = MIN_WINDOW
+        if edges & Qt.Edge.LeftEdge:
+            rect.setLeft(min(rect.left() + delta.x(), rect.right() - min_w))
+        elif edges & Qt.Edge.RightEdge:
+            rect.setRight(max(rect.right() + delta.x(), rect.left() + min_w))
+        if edges & Qt.Edge.TopEdge:
+            rect.setTop(min(rect.top() + delta.y(), rect.bottom() - min_h))
+        elif edges & Qt.Edge.BottomEdge:
+            rect.setBottom(max(rect.bottom() + delta.y(), rect.top() + min_h))
+        self.setGeometry(rect)
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton and self._try_resize_at(
+            e.position().toPoint(), e.globalPosition().toPoint()
+        ):
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        if self._resize_session is not None:
+            self._apply_manual_resize(e.globalPosition().toPoint())
+            return
+        self._update_resize_cursor(e.position().toPoint())
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if self._resize_session is not None:
+            self._resize_session = None
+            self.unsetCursor()
+            QTimer.singleShot(120, self._material.resume)
+            return
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        """窗口外壳：顶边受光 + 底部内阴影，用光交代厚度，不用硬描边。"""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        radius = 0 if self.isMaximized() else RADIUS_WINDOW
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+
+        # 降级：拿不到真实模糊时，铺一层接近材质色的薄膜，别让窗口变成透明水印
+        if self._material.mode == MODE_SOLID:
+            base = QLinearGradient(0.0, 0.0, 0.0, self.height())
+            bottom = QColor(BG)
+            bottom.setAlpha(224)
+            base.setColorAt(0.0, QColor(255, 255, 255, 230))
+            base.setColorAt(1.0, bottom)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(base)
+            p.drawPath(path)
+
+        rim = QLinearGradient(0.0, 0.0, 0.0, self.height())
+        rim.setColorAt(0.0, QColor(255, 255, 255, round(255 * HIGHLIGHT_ALPHA)))
+        rim.setColorAt(0.35, QColor(255, 255, 255, 90))
+        rim.setColorAt(1.0, QColor(255, 255, 255, 40))
+        pen = QPen()
+        pen.setBrush(rim)
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+        shade = QLinearGradient(0.0, self.height() * 0.72, 0.0, self.height())
+        shade.setColorAt(0.0, QColor(0, 0, 0, 0))
+        shade.setColorAt(1.0, QColor(12, 14, 18, 22))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(shade)
+        p.save()
+        p.setClipPath(path)
+        p.drawRect(QRectF(0.0, self.height() * 0.72, self.width(), self.height() * 0.28))
+        p.restore()
+        p.end()
 
     def keyPressEvent(self, e) -> None:  # noqa: N802
         # 无边框窗口要给出可预期的「出口」（Esc = 关闭）

@@ -1,50 +1,99 @@
-"""AirFloat 设计令牌（颜色 / 字体 / 间距 / 圆角）+ QSS 样式表。
+"""AirFloat 设计令牌（材质 / 颜色 / 字体 / 间距 / 圆角）+ QSS 样式表。
 
-设计依据：Apple 设计原则（技能 `apple-design`）。
-- 字体：字号越大字距越紧、越小越松；层级由「字号 + 字重」共同建立，不靠字号单打。
-- 对比：正文 / 次要文字 / 白字填充均按 WCAG AA 4.5:1 校准（每项注释为实测对比度）。
-- 间距：4pt 网格；同组紧凑、异组拉开，用邻近性表达从属关系。
-- 圆角：统一阶梯（窗口 12 / 卡片 10 / 控件 8），不再各处随手 7/8/12/16。
+设计依据：Apple 设计原则（技能 `apple-design`，WWDC 设计演讲）。
+
+毛玻璃版的三条主线：
+- **材质表达层级**：整窗是真实的桌面模糊（亚克力）+ 圆角裁剪；结构分区（侧栏、
+  图片口托盘）用**更重**的一层深色洗，功能控件（卡片 / 按钮）用**更轻**的浅色面。
+  浅色材质绝不叠浅色材质，否则可读性会塌。
+- **对比按最差底校准**：文字不再按白底校准，而是按「材质最暗处」——亚克力着色
+  `BG #EAF4FF` 以 80% 不透明度压在纯黑桌面上 = `#BBC3CC`。每项注真实测对比度。
+- **用光表现厚度**：顶边受光（rim highlight）+ 底部内阴影交代材质厚度，
+  区域之间不用硬分割线（靠材质轻重区分）。
 """
 
 from __future__ import annotations
 
 import sys
 
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont
+
+# ---------- 材质（毛玻璃）----------
+# 亚克力着色：Windows 的 ACCENT_ENABLE_ACRYLICBLURBEHIND 取 ABGR 整数。
+GLASS_TINT_ABGR = 0xCCFFF4EA   # #EAF4FF @ 80%（着色越实，背后的杂色越不干扰文字）
+GLASS_SURFACE = 0.55           # 浅材质面（卡片 / 控件）白色不透明度
+GLASS_SURFACE_HOVER = 0.80     # 悬停：材质更亮 = 更靠近手指
+GLASS_SURFACE_PRESSED = 0.40   # 按下：反馈发生在按下瞬间
+RAIL_ALPHA = 0.10              # 侧栏：更重的材质，用来分隔结构分区
+WELL_ALPHA = 0.05              # 图片口：极轻的凹陷托盘，只做「这里是容器」的暗示
+HAIRLINE_ALPHA = 0.16          # 发丝线（缩略图轮廓等）
+HIGHLIGHT_ALPHA = 0.72         # 顶边受光：让材质看起来有厚度
+RECESS_WASH = "#0C0E12"        # 结构分区 / 托盘的基色（深色洗）
+MENU_BG = "#1C1D22"            # 弹出菜单：深色材质
+MENU_ALPHA = 0.94
+
+
+def wash(alpha: float, base: str = RECESS_WASH) -> QColor:
+    """深色洗：结构分区 / 托盘 / 发丝线统一走这里，避免各处随手写 alpha。"""
+    color = QColor(base)
+    color.setAlphaF(max(0.0, min(1.0, alpha)))
+    return color
+
+
+def wash_css(alpha: float, base: str = RECESS_WASH) -> str:
+    """同 wash()，但给 QSS 用（QSS 只认 rgba(r, g, b, a)）。"""
+    color = QColor(base)
+    return "rgba(%d, %d, %d, %d)" % (color.red(), color.green(), color.blue(), round(alpha * 255))
+
+
+def white_css(alpha: float) -> str:
+    """浅材质面叠层（QSS 用）。"""
+    color = QColor(CARD)
+    return "rgba(%d, %d, %d, %d)" % (
+        color.red(),
+        color.green(),
+        color.blue(),
+        round(max(0.0, min(1.0, alpha)) * 255),
+    )
+
 
 # ---------- 颜色 ----------
-BG = "#EAF3FB"                # 淡蓝背景
-CARD = "#FFFFFF"              # 白色卡片
-TEXT = "#1F2D3D"              # 主文字（白底 13.99:1）
-TEXT_SECONDARY = "#5A6B7E"    # 次要文字（白底 5.47:1 / 蓝底 4.87:1）
-DIVIDER = "#D3E2F0"           # 分隔线 / 发丝边
-PRIMARY = "#4A90D9"           # 浅蓝：仅作装饰填充（开关滑块过渡），不作文字/白字底
-ACCENT = "#2E6CB0"            # 强调色：文字 4.81:1（蓝底）；其上的白字 5.40:1
+BG = "#EAF4FF"                # 材质基色（亚克力 80% 压纯黑 = #BBC3CC，文字的「最差底」）
+CARD = "#FFFFFF"              # 浅材质面基色
+TEXT = "#1B222C"              # 主文字（最差底 8.99:1）
+TEXT_SECONDARY = "#39434F"    # 次要文字（最差底 5.64:1，≥ AA 4.5:1）
+ACCENT = "#2E6CB0"            # 强调色：其上白字 5.40:1
 ACCENT_HOVER = "#2A61A0"
 ACCENT_PRESSED = "#24568F"
-ACCENT_TINT = "#E4EFFB"       # 选中行浅底（其上的强调色文字 4.64:1）
-ACCENT_TINT_BORDER = "#BBD3EE"
-HOVER_BG = "#EEF4FB"          # 悬停底（中性，不与选中的强调底色混淆）
-OFFLINE = "#9AA7B4"           # 关闭 / 离线
-SUCCESS = "#1E7D5C"           # 成功（白底 5.07:1）
-DANGER = "#B3403C"            # 错误（其上的白字 5.65:1）
-WARN_BG = "#FFF6E5"
-WARN_TEXT = "#8A5A12"         # 5.51:1 on WARN_BG
+ACCENT_ICON = "#1568C8"       # 图标底（隔空投送圆钮）：其上白色字形 5.46:1
+OFFLINE = "#6B7280"           # 关闭态圆钮：其上白色字形 4.82:1
+SUCCESS = "#0C452C"           # 成功（文字用，最差底 6.20:1）
+SUCCESS_FILL = "#1E7D5C"      # 成功填充（Toast 底，白字 5.07:1）
+DANGER = "#B3403C"            # 错误填充（其上的白字 5.62:1）
+DANGER_HOVER = "#9C3532"
 
 # ---------- 圆角阶梯 ----------
-RADIUS_WINDOW = 12            # 窗口 / 顶栏 / 状态栏
-RADIUS_CARD = 10              # 卡片 / 按钮 / 缩略图 / 拖放提示
-RADIUS_CONTROL = 8            # 列表项 / 图标按钮 / 选项行
+RADIUS_WINDOW = 20            # 整窗（同时是亚克力裁剪半径）
+RADIUS_CARD = 14              # 模块卡片 / 缩略图
+RADIUS_CONTROL = 10           # 图标按钮 / 菜单行
+RADIUS_MENU = 18              # 弹出菜单
 
 # ---------- 间距（4pt 网格）----------
 SPACE_1 = 4
 SPACE_2 = 8
 SPACE_3 = 12
 SPACE_4 = 16
+SPACE_5 = 20
+SPACE_6 = 24
 
 # ---------- 字体 ----------
-FONT_FAMILIES = ["Segoe UI", "Microsoft YaHei", "PingFang SC"]
+FONT_FAMILIES = [
+    "Segoe UI Variable Text",
+    "Segoe UI",
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "PingFang SC",
+]
 
 # 角色 -> (像素字号, 字重, 字距 px)。字距：大字号收紧、小字号略放开。
 TYPE: dict[str, tuple[int, int, float]] = {
@@ -56,9 +105,11 @@ TYPE: dict[str, tuple[int, int, float]] = {
     "itemTitle": (13, 600, 0.0),   # 列表项主行
     "itemSub": (11, 400, 0.3),     # 列表项副行
     "caption": (11, 400, 0.2),     # 缩略图文件名等说明文字
+    "cardTitle": (14, 600, -0.1),  # 模块卡片标题（隔空投送）
+    "cardValue": (12, 400, 0.2),   # 模块卡片取值行（所有人 ⌄）
+    "menuRow": (14, 400, -0.1),    # 弹出菜单行（大字号收紧字距）
     "emptyTitle": (14, 600, 0.0),
     "emptyBody": (12, 400, 0.2),
-    "emptyIcon": (40, 400, 0.0),
     "status": (11, 400, 0.3),      # 状态栏
     "button": (13, 600, 0.0),
     "toast": (12, 500, 0.2),
@@ -106,20 +157,21 @@ def animations_enabled() -> bool:
     return True
 
 
-# ---- 设备类型图标（与 Node renderer 对齐）----
-DEVICE_ICONS = {
-    "mobile": "📱",
-    "desktop": "🖥️",
-    "web": "🌐",
-    "headless": "🤖",
-    "server": "🗄️",
+# ---- 设备类型图标 ----
+# 用矢量而不是 emoji：彩色 emoji 在毛玻璃上显脏，且不同系统渲染不一致。
+DEVICE_GLYPHS = {
+    "mobile": "phone",
+    "desktop": "laptop",
+    "web": "globe",
+    "headless": "chip",
+    "server": "server",
 }
-DEFAULT_DEVICE_ICON = "📡"
+DEFAULT_DEVICE_GLYPH = "antenna"
 
 
-def device_icon(device_type: str | None) -> str:
-    """设备类型 -> emoji 图标，未知类型回退为天线。"""
-    return DEVICE_ICONS.get((device_type or "").lower(), DEFAULT_DEVICE_ICON)
+def device_glyph(device_type: str | None) -> str:
+    """设备类型 -> 矢量图标名，未知类型回退为天线。"""
+    return DEVICE_GLYPHS.get((device_type or "").lower(), DEFAULT_DEVICE_GLYPH)
 
 
 _FAMILY_QSS = ", ".join('"%s"' % name for name in FONT_FAMILIES) + ", sans-serif"
@@ -130,18 +182,13 @@ QSS = f"""
 * {{ font-family: {_FAMILY_QSS}; }}
 QWidget {{ color: {TEXT}; }}
 
-/* ---------- 窗口主体（承载投影，定义浮窗轮廓与深度）---------- */
-QFrame#windowBody {{
-    background: {CARD};
-    border-radius: {RADIUS_WINDOW}px;
-}}
+/* ---------- 窗口外壳 ----------
+   玻璃与圆角由 AirFloatWindow.paintEvent 画（真模糊 + 窗口区域裁剪），
+   这里所有容器一律透明：任何不透明底色都会挡住背后的模糊。 */
+QWidget#airfloatWindow, QFrame#windowBody {{ background: transparent; }}
 
 /* ---------- 顶栏 ---------- */
-QFrame#topbar {{
-    background: {CARD};
-    border-top-left-radius: {RADIUS_WINDOW}px;
-    border-top-right-radius: {RADIUS_WINDOW}px;
-}}
+QFrame#topbar {{ background: transparent; }}
 QLabel#brandName {{ background: transparent; }}
 QLabel#selfAlias {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QToolButton#folderBtn, QToolButton#closeBtn {{
@@ -149,59 +196,30 @@ QToolButton#folderBtn, QToolButton#closeBtn {{
     border: 1px solid transparent;
     border-radius: {RADIUS_CONTROL}px;
 }}
-QToolButton#folderBtn:hover {{
-    background: {HOVER_BG};
-    border-color: {DIVIDER};
-    color: {TEXT};
-}}
-QToolButton#closeBtn:hover {{
-    background: #FAEBEA;
-    border-color: #EBC9C6;
-    color: {DANGER};
-}}
+QToolButton#folderBtn:hover {{ background: {white_css(GLASS_SURFACE_HOVER)}; }}
+QToolButton#closeBtn:hover {{ background: {DANGER}; }}
 QToolButton#folderBtn:focus, QToolButton#closeBtn:focus {{ border-color: {ACCENT}; }}
 
-/* ---------- 侧栏 ---------- */
-QFrame#sidebar {{ background: {CARD}; border-right: 1px solid {DIVIDER}; }}
-QLabel#rowLabel {{ background: transparent; }}
+/* ---------- 侧栏（更重的材质 = 结构分区）---------- */
+QFrame#sidebar {{ background: {wash_css(RAIL_ALPHA)}; }}
 QLabel#groupTitle {{ color: {TEXT_SECONDARY}; background: transparent; }}
-QPushButton#modeOption {{
-    text-align: left;
-    padding: 7px 10px;
-    border: 1px solid transparent;
-    border-radius: {RADIUS_CONTROL}px;
-    background: transparent;
-    color: {TEXT};
-}}
-QPushButton#modeOption:hover {{ background: {HOVER_BG}; }}
-QPushButton#modeOption:focus {{ border-color: {ACCENT}; }}
-QPushButton#modeOption:checked {{
-    background: {ACCENT_TINT};
-    border-color: {ACCENT_TINT_BORDER};
-    color: {ACCENT};
-}}
 QListWidget#deviceList {{ background: transparent; border: none; outline: none; }}
 QListWidget#deviceList::item {{ background: transparent; }}
 QLabel#deviceEmpty {{ color: {TEXT_SECONDARY}; background: transparent; }}
 
-/* ---------- 图片口 ---------- */
-QFrame#imagePort {{ background: {BG}; }}
-QLabel#emptyIcon {{ color: {TEXT_SECONDARY}; background: transparent; }}
+/* ---------- 图片口（极轻的凹陷托盘）---------- */
+QFrame#imagePort {{ background: {wash_css(WELL_ALPHA)}; }}
 QLabel#emptyMain {{ color: {TEXT}; background: transparent; }}
 QLabel#emptySub {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QLabel#dropOverlay {{
     border: 2px dashed {ACCENT};
     border-radius: {RADIUS_CARD}px;
-    background: rgba(234, 243, 251, 235);
+    background: {white_css(0.92)};
     color: {ACCENT};
 }}
 
 /* ---------- 状态栏 ---------- */
-QFrame#statusbar {{
-    background: {CARD};
-    border-bottom-left-radius: {RADIUS_WINDOW}px;
-    border-bottom-right-radius: {RADIUS_WINDOW}px;
-}}
+QFrame#statusbar {{ background: transparent; }}
 QLabel#statusHint {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QLabel#receivedCount {{ color: {SUCCESS}; background: transparent; }}
 QLabel#progressLabel {{ color: {TEXT_SECONDARY}; background: transparent; }}
@@ -209,17 +227,28 @@ QPushButton#sendBtn {{
     background: {ACCENT};
     color: #FFFFFF;
     border: 1px solid transparent;
-    border-radius: {RADIUS_CARD}px;
+    border-radius: {RADIUS_CONTROL}px;
 }}
 QPushButton#sendBtn:hover {{ background: {ACCENT_HOVER}; }}
 QPushButton#sendBtn:pressed {{ background: {ACCENT_PRESSED}; }}
 QPushButton#sendBtn:focus {{ border-color: #FFFFFF; }}
-QProgressBar#sendProgress {{ background: {BG}; border: none; border-radius: 3px; }}
+QProgressBar#sendProgress {{ background: {white_css(0.55)}; border: none; border-radius: 3px; }}
 QProgressBar#sendProgress::chunk {{ background: {ACCENT}; border-radius: 3px; }}
+
+/* ---------- 缩略图上的删除键 ---------- */
+QToolButton#thumbDelete {{
+    background: {wash_css(0.78)};
+    border: none;
+    border-radius: 10px;
+    color: #FFFFFF;
+}}
+QToolButton#thumbDelete:hover {{ background: {DANGER}; }}
+QToolButton#thumbDelete:pressed {{ background: {DANGER_HOVER}; }}
+QToolButton#thumbDelete:focus {{ border: 1px solid #FFFFFF; }}
 
 /* ---------- Toast ---------- */
 QLabel#toast {{
-    background: rgba(31, 45, 61, 235);
+    background: rgba(27, 34, 44, 235);
     color: #FFFFFF;
     border-radius: 16px;
 }}
@@ -228,7 +257,7 @@ QLabel#toast[kind="success"] {{ background: rgba(30, 125, 92, 245); }}
 
 /* ---------- 滚动条 ---------- */
 QScrollBar:vertical {{ background: transparent; width: 6px; margin: 0; }}
-QScrollBar::handle:vertical {{ background: {DIVIDER}; border-radius: 3px; min-height: 24px; }}
+QScrollBar::handle:vertical {{ background: {wash_css(0.28)}; border-radius: 3px; min-height: 24px; }}
 QScrollBar::handle:vertical:hover {{ background: {ACCENT}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
