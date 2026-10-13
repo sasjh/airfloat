@@ -1,0 +1,29 @@
+# ===== 依赖 =====
+node_modules/
+
+# ===== 构建产物 =====
+dist/
+build/
+release/
+__pycache__/
+*.pyc
+*.spec
+
+# ===== 临时证书（测试遗留） =====
+*.pem
+
+# ===== 日志 =====
+*.log
+
+# ===== 缓存目录 =====
+.electron-cache/
+.npm-cache/
+.localappdata/
+.testapp/
+
+# ===== 系统文件 =====
+Thumbs.db
+.DS_Store
+
+# ��������ͼƬ
+f939e255d805551713270830af5e300c.jpg

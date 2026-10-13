@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file: data:;" />
+  <title>AirFloat</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-name">AirFloat</span>
+        <span class="self-alias" id="self-alias" title="本机标识"></span>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" id="reveal-cache" title="打开接收目录">📁</button>
+      </div>
+    </header>
+
+    <div class="preview-banner" id="preview-banner" hidden>
+      <span class="preview-dot"></span>
+      预览模式：未连接主进程（window.airfloat 不可用）
+    </div>
+
+    <div class="main">
+      <aside class="sidebar">
+        <div class="row switch-row">
+          <span class="row-label">隔空投送</span>
+          <label class="switch" title="开启/关闭隔空投送">
+            <input type="checkbox" id="enabled-switch" />
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+
+        <div class="group">
+          <div class="group-title">可接收对象</div>
+          <div class="option-list" id="mode-list">
+            <button class="option" data-mode="everyone" type="button">
+              <span>所有人</span><span class="check">✓</span>
+            </button>
+            <button class="option" data-mode="contacts" type="button">
+              <span>仅联系人</span><span class="check">✓</span>
+            </button>
+            <button class="option" data-mode="off" type="button">
+              <span>接收关闭</span><span class="check">✓</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="group devices-group">
+          <div class="group-title">附近设备</div>
+          <ul class="device-list" id="device-list"></ul>
+          <div class="device-empty" id="device-empty">未发现手机，请确认同一 WiFi</div>
+        </div>
+      </aside>
+
+      <section class="image-port" id="image-port">
+        <div class="thumb-grid" id="thumb-grid" hidden></div>
+        <div class="empty-state" id="empty-state">
+          <div class="empty-icon">🖼️</div>
+          <p class="empty-main">手机发来的图会出现在这里</p>
+          <p class="empty-sub">拖图片进来可发给手机</p>
+        </div>
+        <div class="drop-overlay" id="drop-overlay">
+          <span>松开以发送到所选设备</span>
+        </div>
+      </section>
+    </div>
+
+    <footer class="statusbar">
+      <div class="progress" id="progress" hidden>
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <span class="progress-label" id="progress-label"></span>
+      </div>
+      <span class="status-hint" id="status-hint"></span>
+      <span class="received-count" id="received-count" hidden></span>
+    </footer>
+
+    <div class="toast" id="toast" hidden></div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

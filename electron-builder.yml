@@ -1,0 +1,11 @@
+appId: com.airfloat.app
+productName: AirFloat
+directories:
+  output: release
+files:
+  - "src/**/*"
+  - "package.json"
+win:
+  target:
+    - portable
+  artifactName: AirFloat-portable.exe

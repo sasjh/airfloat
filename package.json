@@ -1,0 +1,16 @@
+{
+  "name": "airfloat",
+  "version": "0.1.0",
+  "description": "Windows <-> iPhone image floating-window transfer via LocalSend protocol",
+  "main": "src/main/main.js",
+  "author": "",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "electron .",
+    "test:protocol": "node src/protocol/protocol.test.js"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^26.15.3"
+  }
+}
