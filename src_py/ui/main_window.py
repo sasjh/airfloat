@@ -74,6 +74,7 @@ from .styles import (
     ACCENT_ICON,
     ACCENT_PRESSED,
     BG,
+    BOTTOM_SHADE,
     DANGER,
     DANGER_HOVER,
     DEFAULT_DEVICE_GLYPH,
@@ -1911,9 +1912,11 @@ class AirFloatWindow(QWidget):
         # lit 压到 0.55：整窗面积大，高光拉满会发灰发糊。
         paint_glass(p, rect, radius, lit=0.55)
 
+        # 底部内阴影：交代材质下沉，玻璃不是一块平板。
+        # 它压着状态栏文字，所以不透明度是令牌（BOTTOM_SHADE），要跟对比度一起调。
         shade = QLinearGradient(0.0, self.height() * 0.72, 0.0, self.height())
         shade.setColorAt(0.0, QColor(0, 0, 0, 0))
-        shade.setColorAt(1.0, QColor(12, 14, 18, 22))
+        shade.setColorAt(1.0, wash(BOTTOM_SHADE / 255.0))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(shade)
         p.save()

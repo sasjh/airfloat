@@ -272,9 +272,14 @@ def main() -> int:
     app.processEvents()
     check("Esc 关闭窗口", not window.isVisible())
 
-    print("\n[13] 对比度：按材质最差底（#EAF4FF @80% 压纯黑）校准")
-    worst = _flatten(styles.BG, 0.80, "#000000")
-    check("最差底与注释一致 = #BBC3CC", worst == "#BBC3CC", worst)
+    print("\n[13] 对比度：按材质最差底（玻璃最暗处）校准")
+    # 最差底是「逐层压出来」的，不是写死的：玻璃着色 → 最重的结构洗（侧栏）→ 底部内阴影。
+    # 三层全部取自令牌，所以动了其中任何一个都会在这里被重新校验，不会悄悄漂移。
+    tint_alpha = ((styles.GLASS_TINT_ABGR >> 24) & 0xFF) / 255.0
+    worst = _flatten(styles.BG, tint_alpha, "#000000")          # 玻璃压纯黑桌面
+    worst = _flatten(styles.RECESS_WASH, styles.RAIL_ALPHA, worst)   # 再加侧栏的深色洗
+    worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0, worst)  # 再加底部内阴影
+    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 侧栏洗 + 底影 = #92999F", worst == "#92999F", worst)
     for name, color, floor in (
         ("主文字 TEXT", styles.TEXT, 4.5),
         ("次要文字 TEXT_SECONDARY", styles.TEXT_SECONDARY, 4.5),
