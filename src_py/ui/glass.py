@@ -5,9 +5,13 @@
     一块不透明的浅色填充，看不到背后的桌面；
   - SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND) 才是真正把窗口
     背后的内容做高斯模糊的方案。
-亚克力模糊作用于整块窗口矩形，所以圆角必须靠窗口区域裁剪（SetWindowRgn），否则
-四角会露出方形的模糊块。拖动 / 缩放期间亚克力跟随会有拖影，交互期间临时降级成
-纯色，停手后再切回来。
+圆角的坑（实测）：亚克力模糊是 DWM 画的，**它不理会 SetWindowRgn**——只做区域裁剪的话
+四角照样会露出方形的模糊块。正解是让 DWM 自己按圆角裁剪
+（DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND，Windows 11 22H2+）；DWM 的圆角半径
+是系统固定的（100% DPI 下 8px，随 DPI 缩放），应用无法指定更大值，所以窗口自己绘制的
+半径要与它对齐（见 styles.RADIUS_WINDOW），否则圆角处会出现两条不同心的弧。
+
+拖动 / 缩放期间亚克力跟随会有拖影，交互期间临时降级成纯色，停手后再切回来。
 """
 
 from __future__ import annotations
@@ -20,6 +24,13 @@ ACCENT_DISABLED = 0
 ACCENT_ENABLE_BLURBEHIND = 3
 ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
 WCA_ACCENT_POLICY = 19
+
+# 让 DWM 自己把窗口切成圆角（模糊才会跟着圆）。半径由系统决定，
+# 100% DPI 下约 8px 并随 DPI 缩放，应用不能指定更大的值。
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_BORDER_COLOR = 34
+DWMWCP_ROUND = 2
+DWMWA_COLOR_NONE = 0xFFFFFFFE
 
 MODE_ACRYLIC = "acrylic"
 MODE_BLUR = "blur"
@@ -45,12 +56,13 @@ class _CompositionAttribData(ctypes.Structure):
 
 def _load_libraries():
     if not sys.platform.startswith("win"):
-        return None, None
+        return None, None, None
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
     except OSError:
-        return None, None
+        return None, None, None
     user32.SetWindowCompositionAttribute.argtypes = [wintypes.HWND, ctypes.POINTER(_CompositionAttribData)]
     user32.SetWindowCompositionAttribute.restype = wintypes.BOOL
     user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
@@ -59,16 +71,19 @@ def _load_libraries():
     gdi32.CreateRoundRectRgn.restype = wintypes.HRGN
     gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
     gdi32.DeleteObject.restype = wintypes.BOOL
-    return user32, gdi32
+    dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+    return user32, gdi32, dwmapi
 
 
 class GlassMaterial:
     """把窗口变成毛玻璃，并对窗口做圆角裁剪。"""
 
     def __init__(self) -> None:
-        self._user32, self._gdi32 = _load_libraries()
+        self._user32, self._gdi32, self._dwmapi = _load_libraries()
         self._hwnd: int | None = None
         self._mode = MODE_SOLID
+        self._rounded_by_dwm = False
         self._tint = 0xB8FFFFFF
         self._region_key: tuple | None = None
         self._suspended = False
@@ -79,6 +94,11 @@ class GlassMaterial:
     def mode(self) -> str:
         """实际生效的材质：acrylic / blur / solid（降级）。"""
         return self._mode
+
+    @property
+    def rounded_by_dwm(self) -> bool:
+        """DWM 是否接管了圆角裁剪（模糊才会跟着圆）。"""
+        return self._rounded_by_dwm
 
     # ------------------------------------------------------------------ 应用
 
@@ -91,6 +111,7 @@ class GlassMaterial:
             self._mode = MODE_BLUR
         else:
             self._mode = MODE_SOLID
+        self._apply_rounding()
         return self._mode
 
     def set_tint(self, tint_abgr: int) -> None:
@@ -113,6 +134,7 @@ class GlassMaterial:
     def _reapply(self) -> None:
         state = ACCENT_ENABLE_BLURBEHIND if self._mode == MODE_BLUR else ACCENT_ENABLE_ACRYLICBLURBEHIND
         self._apply_accent(state, self._tint)
+        self._apply_rounding()
 
     def _apply_accent(self, state: int, tint_abgr: int) -> bool:
         if not self._user32 or self._hwnd is None:
@@ -129,6 +151,30 @@ class GlassMaterial:
             return False
 
     # ------------------------------------------------------------------ 圆角
+
+    def _apply_rounding(self) -> bool:
+        """让 DWM 按系统圆角裁掉窗口四角（含它自己画的模糊），并去掉默认边框线。"""
+        if not self._dwmapi or self._hwnd is None:
+            return False
+        try:
+            pref = ctypes.c_int(DWMWCP_ROUND)
+            ok = self._dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(self._hwnd),
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(pref),
+                ctypes.sizeof(pref),
+            )
+            border = ctypes.c_uint(DWMWA_COLOR_NONE)
+            self._dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(self._hwnd),
+                DWMWA_BORDER_COLOR,
+                ctypes.byref(border),
+                ctypes.sizeof(border),
+            )
+            self._rounded_by_dwm = ok == 0
+        except Exception:
+            self._rounded_by_dwm = False
+        return self._rounded_by_dwm
 
     def set_rounded(self, width: int, height: int, radius: int, dpr: float = 1.0, enabled: bool = True) -> None:
         if not self._gdi32 or self._hwnd is None:

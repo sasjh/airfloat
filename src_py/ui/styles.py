@@ -27,10 +27,20 @@ GLASS_SURFACE_PRESSED = 0.40   # 按下：反馈发生在按下瞬间
 RAIL_ALPHA = 0.10              # 侧栏：更重的材质，用来分隔结构分区
 WELL_ALPHA = 0.05              # 图片口：极轻的凹陷托盘，只做「这里是容器」的暗示
 HAIRLINE_ALPHA = 0.16          # 发丝线（缩略图轮廓等）
-HIGHLIGHT_ALPHA = 0.72         # 顶边受光：让材质看起来有厚度
 RECESS_WASH = "#0C0E12"        # 结构分区 / 托盘的基色（深色洗）
 MENU_BG = "#1C1D22"            # 弹出菜单：深色材质
 MENU_ALPHA = 0.94
+
+# ---------- 液态玻璃（Liquid Glass）光影 ----------
+# 参考 rdev/liquid-glass-react。折射（对背后像素做位移）在 Qt 桌面端拿不到
+# （背后的桌面由 DWM 在窗口之外合成），这里移植的是光影结构：边缘光 / 光泽 /
+# 镜面热点 / 边缘色差 / 内阴影 / 落影。绘制入口在 liquid.paint_glass()。
+GLASS_RIM_TOP = 0.86           # 受光边（左上）镜面强度
+GLASS_RIM_BOTTOM = 0.20        # 背光边（右下）
+GLASS_GLOSS = 0.30             # 顶部光泽带
+GLASS_SPECULAR = 0.42          # 左上角镜面热点
+GLASS_ABERRATION = 0.18        # 边缘色差（冷 / 暖各偏 1px）
+GLASS_INNER_SHADOW = 0.10      # 按下：玻璃压进去的内阴影
 
 
 def wash(alpha: float, base: str = RECESS_WASH) -> QColor:
@@ -73,7 +83,7 @@ DANGER = "#B3403C"            # 错误填充（其上的白字 5.62:1）
 DANGER_HOVER = "#9C3532"
 
 # ---------- 圆角阶梯 ----------
-RADIUS_WINDOW = 20            # 整窗（同时是亚克力裁剪半径）
+RADIUS_WINDOW = 8             # 整窗：须与 DWM 系统圆角一致（见 glass._apply_rounding）
 RADIUS_CARD = 14              # 模块卡片 / 缩略图
 RADIUS_CONTROL = 10           # 图标按钮 / 菜单行
 RADIUS_MENU = 18              # 弹出菜单
@@ -193,22 +203,22 @@ QLabel#brandName {{ background: transparent; }}
 QLabel#selfAlias {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QToolButton#folderBtn, QToolButton#closeBtn {{
     background: transparent;
-    border: 1px solid transparent;
+    border: none;
     border-radius: {RADIUS_CONTROL}px;
 }}
-QToolButton#folderBtn:hover {{ background: {white_css(GLASS_SURFACE_HOVER)}; }}
-QToolButton#closeBtn:hover {{ background: {DANGER}; }}
-QToolButton#folderBtn:focus, QToolButton#closeBtn:focus {{ border-color: {ACCENT}; }}
+/* 图标按钮的玻璃面由 _GlyphButton.paintEvent 画（悬停 / 按下要有材质与回弹），
+   这里保持透明，任何底色都会挡住玻璃。 */
 
-/* ---------- 侧栏（更重的材质 = 结构分区）---------- */
-QFrame#sidebar {{ background: {wash_css(RAIL_ALPHA)}; }}
+/* ---------- 侧栏（更重的材质 = 结构分区）----------
+   玻璃面同样由 paintEvent 画（liquid.paint_glass）。 */
+QFrame#sidebar {{ background: transparent; }}
 QLabel#groupTitle {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QListWidget#deviceList {{ background: transparent; border: none; outline: none; }}
 QListWidget#deviceList::item {{ background: transparent; }}
 QLabel#deviceEmpty {{ color: {TEXT_SECONDARY}; background: transparent; }}
 
 /* ---------- 图片口（极轻的凹陷托盘）---------- */
-QFrame#imagePort {{ background: {wash_css(WELL_ALPHA)}; }}
+QFrame#imagePort {{ background: transparent; }}
 QLabel#emptyMain {{ color: {TEXT}; background: transparent; }}
 QLabel#emptySub {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QLabel#dropOverlay {{
@@ -224,27 +234,21 @@ QLabel#statusHint {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QLabel#receivedCount {{ color: {SUCCESS}; background: transparent; }}
 QLabel#progressLabel {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QPushButton#sendBtn {{
-    background: {ACCENT};
+    background: transparent;
     color: #FFFFFF;
-    border: 1px solid transparent;
-    border-radius: {RADIUS_CONTROL}px;
+    border: none;
 }}
-QPushButton#sendBtn:hover {{ background: {ACCENT_HOVER}; }}
-QPushButton#sendBtn:pressed {{ background: {ACCENT_PRESSED}; }}
-QPushButton#sendBtn:focus {{ border-color: #FFFFFF; }}
+/* 「发送」按钮是强调色液态玻璃，面由 _SendButton.paintEvent 画（含悬停 / 按下 / 回弹）。 */
 QProgressBar#sendProgress {{ background: {white_css(0.55)}; border: none; border-radius: 3px; }}
 QProgressBar#sendProgress::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 
 /* ---------- 缩略图上的删除键 ---------- */
 QToolButton#thumbDelete {{
-    background: {wash_css(0.78)};
+    background: transparent;
     border: none;
-    border-radius: 10px;
     color: #FFFFFF;
 }}
-QToolButton#thumbDelete:hover {{ background: {DANGER}; }}
-QToolButton#thumbDelete:pressed {{ background: {DANGER_HOVER}; }}
-QToolButton#thumbDelete:focus {{ border: 1px solid #FFFFFF; }}
+/* 深色玻璃片 + 悬停变错误色，面由 _GlyphButton.paintEvent 画。 */
 
 /* ---------- Toast ---------- */
 QLabel#toast {{

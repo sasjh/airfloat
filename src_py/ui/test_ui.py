@@ -19,12 +19,14 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QByteArray, QPoint, QSettings, QSize, Qt  # noqa: E402
+from PySide6.QtCore import QByteArray, QPoint, QRect, QRectF, QSettings, QSize, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage, QPainter  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import ui.main_window as mw  # noqa: E402
+from ui import glass as ui_glass  # noqa: E402
+from ui import liquid as ui_liquid  # noqa: E402
 from ui import styles  # noqa: E402
 
 FAILURES: list[str] = []
@@ -63,6 +65,35 @@ def _flatten(fg_hex: str, alpha: float, under_hex: str) -> str:
         fv, uv = int(f[i : i + 2], 16), int(u[i : i + 2], 16)
         out.append(round(fv * alpha + uv * (1 - alpha)))
     return "#%02X%02X%02X" % tuple(out)
+
+
+def _glass_probe(**kwargs) -> QImage:
+    """把一块液态玻璃画进离屏小图：验证光影分层用，不依赖真实桌面。"""
+    image = QImage(80, 40, QImage.Format.Format_ARGB32)
+    image.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(image)
+    ui_liquid.paint_glass(painter, QRectF(0.5, 0.5, 79.0, 39.0), 10.0, **kwargs)
+    painter.end()
+    return image
+
+
+def _peak_alpha(image: QImage, area: QRect) -> int:
+    """区域内最大的 alpha：边缘描边被抗锯齿摊开，取峰值最稳。"""
+    return max(
+        image.pixelColor(x, y).alpha()
+        for y in range(area.top(), area.bottom() + 1)
+        for x in range(area.left(), area.right() + 1)
+    )
+
+
+def _pixel_diff(first: QImage, second: QImage) -> int:
+    """两张同尺寸图有多少像素不同。"""
+    return sum(
+        1
+        for y in range(first.height())
+        for x in range(first.width())
+        if first.pixel(x, y) != second.pixel(x, y)
+    )
 
 
 def _sample_images(count: int) -> list[str]:
@@ -126,6 +157,14 @@ def main() -> int:
     print("\n[3] 材质")
     check("材质对象存在", window._material is not None)
     check("材质模式可读", window._material.mode in ("acrylic", "blur", "solid"), window._material.mode)
+    # 圆角：模糊是 DWM 画的、不认窗口区域，所以必须让 DWM 自己圆角（常量接线要对），
+    # 而窗口自己的裁剪半径要与 DWM 的系统半径一致，避免出现两条不同心的弧。
+    check("glass 接的是 DWM 圆角偏好",
+          ui_glass.DWMWA_WINDOW_CORNER_PREFERENCE == 33 and ui_glass.DWMWCP_ROUND == 2)
+    check("窗口裁剪半径 = RADIUS_WINDOW 令牌",
+          window._material._region_key is not None and window._material._region_key[2] == mw.RADIUS_WINDOW,
+          str(window._material._region_key))
+    check("RADIUS_WINDOW 与文档一致（8）", mw.RADIUS_WINDOW == 8, str(mw.RADIUS_WINDOW))
 
     print("\n[4] 模块卡片：状态显示")
     window.on_state({"enabled": True, "receiveMode": "everyone", "alias": "我的电脑"})
@@ -253,6 +292,91 @@ def main() -> int:
         check(f"{name} {ratio:.2f}:1 ≥ {floor}", ratio >= floor)
     menu_bg = _flatten(styles.MENU_BG, styles.MENU_ALPHA, worst)
     check(f"菜单文字白字 {_contrast('#FFFFFF', menu_bg):.2f}:1 ≥ 4.5", _contrast("#FFFFFF", menu_bg) >= 4.5)
+
+    print("\n[14] 拖动窗口：顶栏按下即跟手移动（不依赖 startSystemMove）")
+    window.show()
+    window.resize(*mw.DEFAULT_WINDOW)
+    window.move(200, 160)
+    app.processEvents()
+    topbar = window.findChild(mw.TopBar)
+    check("找到顶栏", topbar is not None)
+    QTest.mousePress(topbar, Qt.MouseButton.LeftButton, pos=QPoint(200, 22))
+    app.processEvents()
+    check("按下顶栏即进入拖动会话", window._move_session is not None)
+    QTest.mouseMove(topbar, QPoint(240, 47))
+    app.processEvents()
+    check("窗口跟手位移 (+40,+25)", (window.x(), window.y()) == (240, 185), f"{window.x()},{window.y()}")
+    QTest.mouseRelease(topbar, Qt.MouseButton.LeftButton, pos=QPoint(240, 47))
+    app.processEvents()
+    check("松手结束拖动会话", window._move_session is None)
+    check("松手后窗口停在新位置", (window.x(), window.y()) == (240, 185), f"{window.x()},{window.y()}")
+
+    print("\n[15] 液态玻璃：光影结构 + 玻璃面接线")
+    # 一层一层验：高光强度可关（lit=0 必须全透明，绝不挡住背后的真实模糊）
+    check("lit=0 ⇒ 整块透明（高光强度可控）", _peak_alpha(_glass_probe(lit=0.0), QRect(0, 0, 79, 39)) == 0)
+    # 默认只画光影：内部透明、边缘发光 —— 玻璃是「边缘在反光」，不是一块实心贴纸
+    rim = _glass_probe()
+    check("内部保持透明（远离高光处不实心挡底）", rim.pixelColor(60, 33).alpha() == 0,
+          str(rim.pixelColor(60, 33).alpha()))
+    top_edge, bottom_edge = QRect(30, 0, 20, 2), QRect(30, 38, 20, 2)
+    check("受光边（上）有镜面高光", _peak_alpha(rim, top_edge) > 0)
+    check("背光边（下）比受光边淡", _peak_alpha(rim, top_edge) > _peak_alpha(rim, bottom_edge),
+          f"{_peak_alpha(rim, top_edge)} vs {_peak_alpha(rim, bottom_edge)}")
+    # 四层光影各自独立接线：关掉任何一层，画面都必须变
+    for label, kwargs in (
+        ("顶部光泽", {"gloss": False}),
+        ("镜面热点", {"specular": False}),
+        ("边缘色差", {"aberration": False}),
+        ("镜面边缘光", {"rim": False}),
+    ):
+        check(f"{label}确实画了", _pixel_diff(rim, _glass_probe(**kwargs)) > 0)
+    # 按下：内阴影把顶边压暗（同一块玻璃，按下后更暗）
+    flat = {"tint": QColor("#FFFFFF"), "alpha": 0.55, "gloss": False, "specular": False,
+            "aberration": False, "rim": False}
+    plain, dent = _glass_probe(**flat), _glass_probe(**flat, pressed=True)
+    check("按下压出内阴影（顶边变暗）",
+          dent.pixelColor(40, 3).lightness() < plain.pixelColor(40, 3).lightness(),
+          f"{dent.pixelColor(40, 3).lightness()} vs {plain.pixelColor(40, 3).lightness()}")
+    # 浅材质面是半透明的（实底会把背后的模糊挡死）
+    face = _glass_probe(
+        tint=QColor("#FFFFFF"), alpha=0.55, gloss=False, specular=False, aberration=False, rim=False
+    ).pixelColor(40, 20).alpha()
+    check("浅材质面半透明（落在 0.55 的上下渐变里，不是实底）", 115 <= face <= 160, str(face))
+    # 回弹：按下缩一点、松手弹回
+    spring = mw.PressSpring(window)
+    spring.press()
+    QTest.qWait(260)
+    check("按下回弹：按下时缩一点", spring.scale < 1.0, f"{spring.scale:.3f}")
+    spring.release()
+    QTest.qWait(260)
+    check("松手弹回原尺寸", abs(spring.scale - 1.0) < 1e-6, f"{spring.scale:.3f}")
+    # 玻璃是半透明的：白字压在强调色玻璃上（最差底）也得 ≥ 4.5:1
+    for label, color, alpha in (
+        ("常态", styles.ACCENT, 0.94),
+        ("悬停", styles.ACCENT_HOVER, 0.96),
+        ("按下", styles.ACCENT_PRESSED, 0.98),
+    ):
+        ratio = _contrast("#FFFFFF", _flatten(color, alpha, worst))
+        check(f"发送键白字（{label}）{ratio:.2f}:1 ≥ 4.5", ratio >= 4.5)
+    # 接线：该用玻璃的地方都用上了；容器不再自己铺底色（否则会挡住玻璃）
+    check("侧栏是玻璃底板", isinstance(window.findChild(mw.GlassSurface), mw.GlassSurface))
+    check("发送键是强调色玻璃按钮", isinstance(window._send_btn, mw._SendButton))
+    check("图标按钮悬挂停玻璃（文件夹 / 关闭）",
+          (window._folder_btn._hover_tone, window._close_btn._hover_tone) == ("light", "danger"))
+    probe_thumb = mw.ThumbWidget(paths[0], "probe.png")
+    check("删除键：常显深色玻璃 + 悬停错误色",
+          (probe_thumb._delete_btn._rest_tone, probe_thumb._delete_btn._hover_tone) == ("dark", "danger"))
+    probe_thumb.deleteLater()
+    check("tone 表认得 light，未知回退 None",
+          mw._tone("light") is not None and mw._tone("none") is None and mw._tone("nope") is None)
+    # 删除键压在**任意照片**上：最差是纯白照片，白字形也得 ≥ 3:1
+    scrim = _flatten("#0C0E12", 0.58, "#FFFFFF")
+    ratio = _contrast("#FFFFFF", scrim)
+    check(f"删除键白字形（压纯白照片）{ratio:.2f}:1 ≥ 3.0", ratio >= 3.0, scrim)
+    check("页面容器不再自己铺底色（玻璃由 paintEvent 画）",
+          "QFrame#sidebar { background: transparent; }" in styles.QSS
+          and "QFrame#imagePort { background: transparent; }" in styles.QSS
+          and "QPushButton#sendBtn:hover" not in styles.QSS)
 
     check("自测没有写用户真实配置", _snapshot(QSettings(*real_scope)) == real_before)
     QSettings(mw.SETTINGS_ORG, mw.SETTINGS_APP).clear()

@@ -40,7 +40,6 @@ from PySide6.QtGui import (
     QImageReader,
     QLinearGradient,
     QPainter,
-    QPainterPath,
     QPen,
     QPixmap,
 )
@@ -68,17 +67,21 @@ from PySide6.QtWidgets import (
 
 from .glass import MODE_SOLID, GlassMaterial
 from .glyphs import paint_glyph
+from .liquid import GlassSurface, PressSpring, glass_path, paint_glass, scaled_rect
 from .styles import (
     ACCENT,
+    ACCENT_HOVER,
     ACCENT_ICON,
+    ACCENT_PRESSED,
     BG,
+    DANGER,
+    DANGER_HOVER,
     DEFAULT_DEVICE_GLYPH,
     GLASS_SURFACE,
     GLASS_SURFACE_HOVER,
     GLASS_SURFACE_PRESSED,
     GLASS_TINT_ABGR,
     HAIRLINE_ALPHA,
-    HIGHLIGHT_ALPHA,
     MENU_ALPHA,
     MENU_BG,
     OFFLINE,
@@ -87,12 +90,15 @@ from .styles import (
     RADIUS_CONTROL,
     RADIUS_MENU,
     RADIUS_WINDOW,
+    RAIL_ALPHA,
+    RECESS_WASH,
     SPACE_1,
     SPACE_2,
     SPACE_3,
     SPACE_5,
     TEXT,
     TEXT_SECONDARY,
+    WELL_ALPHA,
     animations_enabled,
     apply_type,
     device_glyph,
@@ -213,8 +219,26 @@ def _load_thumb(path: str, w: int, h: int) -> QPixmap | None:
 # --------------------------------------------------------------------------- #
 # 小控件：矢量图标（毛玻璃上不用 emoji —— 彩色 emoji 会显脏、基线也对不齐）
 # --------------------------------------------------------------------------- #
+# 图标按钮的液态玻璃片：tone -> (底色, 不透明度)
+# 「dark」是照片上的遮罩片，压的是**任意照片色**：取 0.58 才能保证白字形在纯白照片上
+# 仍有 4.74:1（≥3:1 是图标底线），0.30 那种轻玻璃会把白色字形洗掉。
+_TONES: dict[str, tuple[str, float]] = {
+    "light": ("#FFFFFF", GLASS_SURFACE),
+    "bright": ("#FFFFFF", GLASS_SURFACE_HOVER),
+    "dark": ("#0C0E12", 0.58),
+    "danger": (DANGER, 0.92),
+    "danger_deep": (DANGER_HOVER, 0.96),
+}
+
+
+def _tone(name: str) -> tuple[QColor, float] | None:
+    """把 tone 名解析成 paint_glass 的 (底色, 不透明度)；未知 / "none" = 不画底色。"""
+    spec = _TONES.get(name)
+    return None if spec is None else (QColor(spec[0]), spec[1])
+
+
 class _GlyphButton(QToolButton):
-    """矢量图标按钮：图标由 QPainter 画，颜色随悬停切换。"""
+    """矢量图标按钮：图标由 QPainter 画，底色是液态玻璃片（悬停 / 按下带材质与回弹）。"""
 
     def __init__(
         self,
@@ -224,16 +248,93 @@ class _GlyphButton(QToolButton):
         color: str = "",
         hover_color: str = "",
         parent: QWidget | None = None,
+        *,
+        tone: str = "none",
+        hover_tone: str = "light",
     ) -> None:
         super().__init__(parent)
         self._glyph = glyph
         self._color = QColor(color or TEXT)
         self._hover_color = QColor(hover_color) if hover_color else None
+        self._rest_tone = tone
+        self._hover_tone = hover_tone
         self._hover = False
+        self._pressed = False
+        self._spring = PressSpring(self)
         self.setToolTip(tip)
         self.setFixedSize(size, size)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def _glass_tone(self) -> str:
+        """当前该画哪一片玻璃：按下比悬停更「实」（错误色按下再深一档）。"""
+        if self._pressed:
+            tone = self._hover_tone
+            return "danger_deep" if tone == "danger" else tone
+        return self._hover_tone if self._hover else self._rest_tone
+
+    def enterEvent(self, e) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        self._hover = False
+        self._pressed = False
+        self.update()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self._spring.press()
+            self.update()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if self._pressed:
+            self._pressed = False
+            self._spring.release()
+            self.update()
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = scaled_rect(
+            QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0), self._spring.scale
+        )
+        fill = _tone(self._glass_tone())
+        if fill is not None:
+            tint, alpha = fill
+            paint_glass(
+                p,
+                rect,
+                RADIUS_CONTROL,
+                tint=tint,
+                alpha=alpha,
+                lit=0.9 if self._pressed else 1.1,
+                pressed=self._pressed,
+                specular=False,
+            )
+        color = self._hover_color if (self._hover and self._hover_color is not None) else self._color
+        paint_glyph(p, self._glyph, rect, color)
+        if self.hasFocus():
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), RADIUS_CONTROL - 2, RADIUS_CONTROL - 2)
+        p.end()
+
+
+class _SendButton(QPushButton):
+    """「发送」按钮：强调色液态玻璃 —— 悬停更亮、按下压进去，松手回弹。"""
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._hover = False
+        self._pressed = False
+        self._spring = PressSpring(self)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
     def enterEvent(self, e) -> None:  # noqa: N802
@@ -243,20 +344,52 @@ class _GlyphButton(QToolButton):
 
     def leaveEvent(self, e) -> None:  # noqa: N802
         self._hover = False
+        self._pressed = False
         self.update()
         super().leaveEvent(e)
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self._spring.press()
+            self.update()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if self._pressed:
+            self._pressed = False
+            self._spring.release()
+            self.update()
+        super().mouseReleaseEvent(e)
 
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = self._hover_color if (self._hover and self._hover_color is not None) else self._color
-        paint_glyph(p, self._glyph, self.rect(), color)
+        rect = scaled_rect(
+            QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0), self._spring.scale
+        )
+        if self._pressed:
+            tint, alpha, lit = ACCENT_PRESSED, 0.98, 0.9
+        elif self._hover:
+            tint, alpha, lit = ACCENT_HOVER, 0.96, 1.12
+        else:
+            tint, alpha, lit = ACCENT, 0.94, 1.0
+        paint_glass(
+            p,
+            rect,
+            RADIUS_CONTROL,
+            tint=QColor(tint),
+            alpha=alpha,
+            lit=lit,
+            pressed=self._pressed,
+        )
+        p.setPen(QColor("#FFFFFF"))
+        p.setFont(self.font())
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
         if self.hasFocus():
-            p.setPen(QPen(QColor(ACCENT), 2))
+            p.setPen(QPen(QColor("#FFFFFF"), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(
-                QRectF(1, 1, self.width() - 2, self.height() - 2), RADIUS_CONTROL - 2, RADIUS_CONTROL - 2
-            )
+            p.drawRoundedRect(rect.adjusted(2, 2, -2, -2), RADIUS_CONTROL - 2, RADIUS_CONTROL - 2)
         p.end()
 
 
@@ -353,7 +486,14 @@ class ThumbWidget(QWidget):
 
         # 删除键：常显（照片上的删除键要一眼看见），悬停变错误色
         self._delete_btn = _GlyphButton(
-            "close", "移除这张图", size=DELETE_BTN, color="#FFFFFF", hover_color="#FFFFFF", parent=self
+            "close",
+            "移除这张图",
+            size=DELETE_BTN,
+            color="#FFFFFF",
+            hover_color="#FFFFFF",
+            parent=self,
+            tone="dark",
+            hover_tone="danger",
         )
         self._delete_btn.setObjectName("thumbDelete")
         self._delete_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -366,13 +506,23 @@ class ThumbWidget(QWidget):
         w, h = self.width(), self.height()
 
         card = QRectF(0, 0, w, h)
-        path = QPainterPath()
-        path.addRoundedRect(card, RADIUS_CARD, RADIUS_CARD)
-        p.setClipPath(path)
+        path = glass_path(card, RADIUS_CARD)
 
+        # 液态玻璃片：镜面边缘光 + 顶部光泽（图片压在它上面，只有边缘和文件名条露得出来）
+        paint_glass(
+            p,
+            card,
+            RADIUS_CARD,
+            tint=QColor(255, 255, 255),
+            alpha=GLASS_SURFACE,
+            lit=0.9,
+            specular=False,
+            aberration=False,
+        )
         p.setPen(QPen(wash(HAIRLINE_ALPHA), 1))
-        p.setBrush(QColor(255, 255, 255, round(GLASS_SURFACE * 255)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(card, RADIUS_CARD, RADIUS_CARD)
+        p.setClipPath(path)
 
         img_rect = QRectF(1, 1, w - 2, THUMB_IMG_H - 2)
         if self._pixmap is not None:
@@ -489,6 +639,26 @@ class ImagePort(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(self._scroll)
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        """图片口托盘：极轻的液态玻璃凹陷面（只留底色 + 顶部光泽）。
+
+        结构分区是铺满的，不套边缘光 / 色差 —— 全出血矩形上画描边就成了硬分割线，
+        而设计约定「区域之间不画硬线」，靠材质轻重区分就够了。
+        """
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        paint_glass(
+            p,
+            QRectF(0.0, 0.0, float(self.width()), float(self.height())),
+            0.0,
+            tint=QColor(RECESS_WASH),
+            alpha=WELL_ALPHA,
+            specular=False,
+            aberration=False,
+            rim=False,
+        )
+        p.end()
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
@@ -608,28 +778,24 @@ class AirdropCard(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
 
-        # 浅材质面：结构分区（侧栏）比它重，所以这里叠白是「更靠近手指」，不是叠浅材质
-        if self._pressed and not self._icon_pressed:
-            alpha = GLASS_SURFACE_PRESSED          # 按下就变，不等抬起
+        # 浅材质面：结构分区（侧栏）比它重，所以这里叠白是「更靠近手指」，不是叠浅材质。
+        # 液态玻璃：镜面边缘光 + 顶部光泽 + 左上镜面热点 + 边缘色差。
+        card_pressed = self._pressed and not self._icon_pressed
+        if card_pressed:
+            alpha, lit = GLASS_SURFACE_PRESSED, 0.9   # 按下就变，不等抬起
         elif self._hover:
-            alpha = GLASS_SURFACE_HOVER
+            alpha, lit = GLASS_SURFACE_HOVER, 1.15
         else:
-            alpha = GLASS_SURFACE
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, round(alpha * 255)))
-        p.drawRoundedRect(rect, RADIUS_CARD, RADIUS_CARD)
-
-        # 顶边受光：浅材质也要有厚度，否则像一张贴纸
-        rim = QLinearGradient(0.0, 0.0, 0.0, rect.height())
-        rim.setColorAt(0.0, QColor(255, 255, 255, round(255 * HIGHLIGHT_ALPHA)))
-        rim.setColorAt(0.5, QColor(255, 255, 255, 46))
-        rim.setColorAt(1.0, QColor(255, 255, 255, 26))
-        pen = QPen()
-        pen.setBrush(rim)
-        pen.setWidthF(1.0)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(rect, RADIUS_CARD, RADIUS_CARD)
+            alpha, lit = GLASS_SURFACE, 1.0
+        paint_glass(
+            p,
+            rect,
+            RADIUS_CARD,
+            tint=QColor(255, 255, 255),
+            alpha=alpha,
+            lit=lit,
+            pressed=card_pressed,
+        )
 
         # 圆钮：开 = 强调蓝（其上白色字形 5.46:1），关 = 中性灰（4.82:1）
         icon = self._icon_rect()
@@ -641,6 +807,8 @@ class AirdropCard(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(fill)
         p.drawEllipse(icon)
+        # 圆钮也是一枚小透镜：压一层高光，否则像贴纸
+        paint_glass(p, icon, icon.width() / 2.0, lit=0.55, aberration=False)
         paint_glyph(p, "airdrop", icon.adjusted(SPACE_3, SPACE_3, -SPACE_3, -SPACE_3), QColor("#FFFFFF"))
 
         # 取值行尾的展开提示
@@ -716,22 +884,9 @@ class _MenuPanel(QFrame):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
-        bg = QColor(MENU_BG)
-        bg.setAlphaF(MENU_ALPHA)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(bg)
-        p.drawRoundedRect(rect, RADIUS_MENU, RADIUS_MENU)
-
-        rim = QLinearGradient(0.0, 0.0, 0.0, rect.height())
-        rim.setColorAt(0.0, QColor(255, 255, 255, 58))
-        rim.setColorAt(0.4, QColor(255, 255, 255, 20))
-        rim.setColorAt(1.0, QColor(255, 255, 255, 14))
-        pen = QPen()
-        pen.setBrush(rim)
-        pen.setWidthF(1.0)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(rect, RADIUS_MENU, RADIUS_MENU)
+        # 深色液态玻璃：底色 + 顶部光泽 + 镜面边缘光。
+        # lit 压到 0.8：深色面上高光太亮会发灰，白字对比度反而掉。
+        paint_glass(p, rect, RADIUS_MENU, tint=QColor(MENU_BG), alpha=MENU_ALPHA, lit=0.8)
         p.end()
 
 
@@ -775,9 +930,17 @@ class _ModeRow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         if self._hover or self._pressed:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, 46 if self._pressed else HOVER_WHITE))
-            p.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
+            paint_glass(
+                p,
+                rect,
+                RADIUS_CONTROL,
+                tint=QColor(255, 255, 255),
+                alpha=(46 if self._pressed else HOVER_WHITE) / 255.0,
+                lit=0.7,
+                pressed=self._pressed,
+                specular=False,
+                aberration=False,
+            )
         if self._selected:
             paint_glyph(
                 p, "check", QRectF(SPACE_3 - 1, (self.height() - 13) / 2.0, 13, 13), QColor("#FFFFFF")
@@ -962,9 +1125,7 @@ class TopBar(QFrame):
                 if window._try_resize_at(local, e.globalPosition().toPoint()):
                     e.accept()
                     return
-            handle = self.window().windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
+                window._begin_move(e.globalPosition().toPoint())
                 e.accept()
                 return
         super().mousePressEvent(e)
@@ -972,8 +1133,20 @@ class TopBar(QFrame):
     def mouseMoveEvent(self, e) -> None:  # noqa: N802
         window = self.window()
         if isinstance(window, AirFloatWindow):
+            if window._move_session is not None:
+                window._apply_move(e.globalPosition().toPoint())
+                e.accept()
+                return
             window._update_resize_cursor(self.mapTo(window, e.position().toPoint()))
         super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        window = self.window()
+        if isinstance(window, AirFloatWindow) and window._move_session is not None:
+            window._end_move()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
 
 
 # --------------------------------------------------------------------------- #
@@ -1016,6 +1189,7 @@ class AirFloatWindow(QWidget):
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self._glass_ready = False
         self._resize_session: dict | None = None
+        self._move_session: dict | None = None
         self._resize_settle = QTimer(self)
         self._resize_settle.setSingleShot(True)
         self._resize_settle.timeout.connect(self._material.resume)
@@ -1073,7 +1247,12 @@ class AirFloatWindow(QWidget):
         self._folder_btn = _GlyphButton("folder", "打开接收目录", parent=topbar)
         self._folder_btn.setObjectName("folderBtn")
         self._close_btn = _GlyphButton(
-            "close", "关闭窗口", color=TEXT, hover_color="#FFFFFF", parent=topbar
+            "close",
+            "关闭窗口",
+            color=TEXT,
+            hover_color="#FFFFFF",
+            parent=topbar,
+            hover_tone="danger",
         )
         self._close_btn.setObjectName("closeBtn")
         tb.addWidget(brand)
@@ -1089,9 +1268,9 @@ class AirFloatWindow(QWidget):
         main.setSpacing(0)
 
         # 左窄栏
-        sidebar = QFrame(self._body)
+        # 侧栏是「更重」的结构分区：液态玻璃底板，比卡片暗一档（深色洗 + 顶部光泽）
+        sidebar = GlassSurface(self._body, tint=QColor(RECESS_WASH), alpha=RAIL_ALPHA)
         sidebar.setObjectName("sidebar")
-        sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         sidebar.setFixedWidth(SIDEBAR_W)
         sb = QVBoxLayout(sidebar)
         sb.setContentsMargins(SPACE_3, SPACE_3, SPACE_3, SPACE_3)
@@ -1167,7 +1346,7 @@ class AirFloatWindow(QWidget):
         self._received_count.setVisible(False)
         st.addWidget(self._received_count)
 
-        self._send_btn = QPushButton("发送", statusbar)
+        self._send_btn = _SendButton("发送", statusbar)
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.setFixedSize(SEND_BTN_W, SEND_BTN_H)
@@ -1457,6 +1636,11 @@ class AirFloatWindow(QWidget):
             it = self._image_port._grid.takeAt(0)
             w = it.widget()
             if w is not None:
+                # deleteLater 要等事件循环空闲才真正销毁：先摘下来并隐藏，
+                # 否则这一帧里旧缩略图仍挂在原位，会和重排后的新图叠在一起
+                #（连收几张图、或缩放窗口触发重排时都能看到）。
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
         has = bool(self._received_items)
         self._image_port._empty_state.setVisible(not has)
@@ -1578,7 +1762,11 @@ class AirFloatWindow(QWidget):
             self.move(area.center() - QPoint(self.width() // 2, area.height() // 3))
 
     def _update_region(self) -> None:
-        """圆角靠窗口区域裁剪：亚克力模糊是矩形，不裁四角会露出方块。"""
+        """窗口内容裁进圆角区域。
+
+        DWM 自己画的模糊不认窗口区域，圆角由 glass 的 DWMWA_WINDOW_CORNER_PREFERENCE
+        负责；半径取自 styles.RADIUS_WINDOW，两边必须一致。
+        """
         if not self._glass_ready:
             return
         self._material.set_rounded(
@@ -1640,6 +1828,27 @@ class AirFloatWindow(QWidget):
         self.setCursor(self._cursor_for(edges))
         return True
 
+    def _begin_move(self, global_pos: QPoint) -> None:
+        """开始拖动：记住按下点与当时的窗口位置。
+
+        不用 QWindow.startSystemMove()：无边框 + 分层（透明）窗口在 Win11 上实测它返回
+        True，窗口却纹丝不动（真机与自动化各测两次，位移全是 0）。自己跟手移动最稳，
+        行为也和八向缩放保持一致。
+        """
+        self._move_session = {"origin": global_pos, "geometry": QRect(self.geometry())}
+        self._material.suspend()
+
+    def _apply_move(self, global_pos: QPoint) -> None:
+        """跟手移动窗口：位移量 = 当前鼠标 - 按下时鼠标。"""
+        session = self._move_session
+        if session is None:
+            return
+        self.move(session["geometry"].topLeft() + (global_pos - session["origin"]))
+
+    def _end_move(self) -> None:
+        self._move_session = None
+        self._resize_settle.start(RESIZE_SETTLE_MS)
+
     def _apply_manual_resize(self, global_pos: QPoint) -> None:
         session = self._resize_session
         edges = session["edges"]
@@ -1680,13 +1889,12 @@ class AirFloatWindow(QWidget):
         super().mouseReleaseEvent(e)
 
     def paintEvent(self, _e) -> None:  # noqa: N802
-        """窗口外壳：顶边受光 + 底部内阴影，用光交代厚度，不用硬描边。"""
+        """窗口外壳：液态玻璃 + 底部内阴影 —— 用光交代厚度，不用硬描边。"""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         radius = 0 if self.isMaximized() else RADIUS_WINDOW
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
-        path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
+        path = glass_path(rect, radius)
 
         # 降级：拿不到真实模糊时，铺一层接近材质色的薄膜，别让窗口变成透明水印
         if self._material.mode == MODE_SOLID:
@@ -1699,16 +1907,9 @@ class AirFloatWindow(QWidget):
             p.setBrush(base)
             p.drawPath(path)
 
-        rim = QLinearGradient(0.0, 0.0, 0.0, self.height())
-        rim.setColorAt(0.0, QColor(255, 255, 255, round(255 * HIGHLIGHT_ALPHA)))
-        rim.setColorAt(0.35, QColor(255, 255, 255, 90))
-        rim.setColorAt(1.0, QColor(255, 255, 255, 40))
-        pen = QPen()
-        pen.setBrush(rim)
-        pen.setWidthF(1.0)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
+        # 液态玻璃：镜面边缘光（对角受光）+ 顶部光泽 + 左上镜面热点 + 边缘色差。
+        # lit 压到 0.55：整窗面积大，高光拉满会发灰发糊。
+        paint_glass(p, rect, radius, lit=0.55)
 
         shade = QLinearGradient(0.0, self.height() * 0.72, 0.0, self.height())
         shade.setColorAt(0.0, QColor(0, 0, 0, 0))
