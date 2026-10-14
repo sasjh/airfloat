@@ -112,17 +112,12 @@ from .styles import (
     GLASS_SURFACE,
     GLASS_TINT_ABGR,
     HAIRLINE_ALPHA,
+    HINT_TEXT,
     MENU_ALPHA,
     MENU_BG,
     MENU_ROW_HOVER,
     MENU_ROW_PRESSED,
     OFFLINE,
-    POOL_ALPHA,
-    POOL_CORE,
-    POOL_MID,
-    POOL_MID_ALPHA,
-    POOL_RX,
-    POOL_RY,
     QSS,
     RADIUS_CARD,
     RADIUS_CONTROL,
@@ -143,7 +138,6 @@ from .styles import (
     TEXT_SECONDARY,
     TOPBAR_FACE,
     TOPBAR_SHEEN,
-    WELL_ALPHA,
     animations_enabled,
     apply_type,
     device_glyph,
@@ -678,12 +672,19 @@ class ImagePort(QFrame):
         ev = QVBoxLayout(self._empty_state)
         ev.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev.setSpacing(SPACE_2)
-        icon = _GlyphLabel("image", 44, TEXT_SECONDARY, self._empty_state)
-        main = apply_type(QLabel("手机发来的图会出现在这里", self._empty_state), "emptyTitle")
-        main.setObjectName("emptyMain")
-        main.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 空态提示照参考图（iOS「Clear」）那套排：一个符号 + 一行大标题 + 一行副行，
+        # **只有一档不透明度**（都是亮字，差的只是字号），周围不垫底也不描边 ——
+        # 图片口是整窗最透的地方，垫什么都是一块看得见的板，加描边就是字周围多出一圈。
+        icon = _GlyphLabel("image", 40, HINT_TEXT, self._empty_state)
+        title = apply_type(QLabel("手机发来的图", self._empty_state), "emptyTitle")
+        title.setObjectName("emptyMain")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub = apply_type(QLabel("会出现在这里", self._empty_state), "emptySub")
+        sub.setObjectName("emptySub")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev.addWidget(icon)
-        ev.addWidget(main)
+        ev.addWidget(title)
+        ev.addWidget(sub)
 
         # 缩略图网格（滚动）
         self._scroll = QScrollArea(self)
@@ -719,44 +720,6 @@ class ImagePort(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(self._scroll)
-
-    def paintEvent(self, _e) -> None:  # noqa: N802
-        """图片口：极轻的凹陷托盘 + 空态的一小片柔光。
-
-        结构分区是铺满的，不套边缘光 / 色差 —— 全出血矩形上画描边就成了硬分割线，
-        而设计约定「区域之间不画硬线」，靠材质轻重区分就够了。
-        """
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(0.0, 0.0, float(self.width()), float(self.height()))
-        paint_glass(
-            p,
-            rect,
-            0.0,
-            tint=QColor(RECESS_WASH),
-            alpha=WELL_ALPHA,
-            gloss=False,
-            specular=False,
-            aberration=False,
-            rim=False,
-        )
-        # 空态文字自带一小片扁柔光：图片口是整窗最透的地方，但不能为此给文字糊一块
-        # 有硬边的面 —— 用光托住它，边界看不出来，字也站得住（见 test_ui 的对比度）。
-        # 之所以是扁椭圆而不是圆：圆池会占掉大半个图片口，在 16% 的玻璃上就是一块灰斑。
-        if self._empty_state.isVisible():
-            pool = QRadialGradient(QPointF(0.0, 0.0), 1.0)
-            pool.setColorAt(0.0, QColor(255, 255, 255, round(255 * POOL_ALPHA)))
-            pool.setColorAt(POOL_CORE, QColor(255, 255, 255, round(255 * POOL_ALPHA)))
-            pool.setColorAt(POOL_MID, QColor(255, 255, 255, round(255 * POOL_ALPHA * POOL_MID_ALPHA)))
-            pool.setColorAt(1.0, QColor(255, 255, 255, 0))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(pool)
-            p.save()
-            p.translate(rect.center())
-            p.scale(rect.width() * POOL_RX, rect.height() * POOL_RY)
-            p.drawEllipse(QPointF(0.0, 0.0), 1.0, 1.0)
-            p.restore()
-        p.end()
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
@@ -2150,26 +2113,47 @@ class AirFloatWindow(QWidget):
         p.restore()
 
     def _paint_top_face(self, p: QPainter) -> None:
-        """顶栏浅面 + 最上沿再亮一档，往下渐隐进内容（顶栏亮 → 内容中）。"""
-        band = QRectF(0.0, 0.0, float(self.width()), TOPBAR_H * FACE_FALLOFF)
-        sheen = QLinearGradient(band.topLeft(), band.bottomLeft())
+        """顶栏浅面 + 最上沿再亮一档，往下渐隐进内容（顶栏亮 → 内容中）。
+
+        渐隐的那一段只铺**内容列**：侧栏那一列有它自己的薄面（SIDEBAR_FACE），两套面
+        叠在同一块地方，会把侧栏顶上一条抬成一块发白的斑 —— 材质只有一本账。
+        """
+        band_h = TOPBAR_H * FACE_FALLOFF
+        sheen = QLinearGradient(QPointF(0.0, 0.0), QPointF(0.0, band_h))
         sheen.setColorAt(0.0, QColor(255, 255, 255, round(255 * (TOPBAR_FACE + TOPBAR_SHEEN))))
-        sheen.setColorAt(TOPBAR_H / band.height(), QColor(255, 255, 255, round(255 * TOPBAR_FACE)))
+        sheen.setColorAt(TOPBAR_H / band_h, QColor(255, 255, 255, round(255 * TOPBAR_FACE)))
         sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setBrush(sheen)
-        p.drawRect(band)
+        # 同一支渐变分两块铺（顶栏本身整宽 + 往下的渐隐段只给内容列），两块严丝合缝
+        p.drawRect(QRectF(0.0, 0.0, float(self.width()), float(TOPBAR_H)))
+        p.drawRect(
+            QRectF(float(SIDEBAR_W), float(TOPBAR_H), float(self.width() - SIDEBAR_W), band_h - TOPBAR_H)
+        )
 
     def _paint_foot_face(self, p: QPainter) -> None:
-        """状态栏浅面 + 底部内阴影：一档亮（面）一档深（影），沉下去而字仍清楚。"""
+        """状态栏浅面 + 底部内阴影：一档亮（面）一档深（影），沉下去而字仍清楚。
+
+        与顶栏同一条规矩：渐隐段只铺内容列，不和侧栏的薄面叠在一起。
+        """
         band_h = STATUSBAR_H * FACE_FALLOFF
-        band = QRectF(0.0, self.height() - band_h, float(self.width()), band_h)
-        face = QLinearGradient(band.topLeft(), band.bottomLeft())
+        band_top = float(self.height()) - band_h
+        face = QLinearGradient(QPointF(0.0, band_top), QPointF(0.0, float(self.height())))
         face.setColorAt(0.0, QColor(255, 255, 255, 0))
         floor = QColor(255, 255, 255, round(255 * STATUSBAR_FACE))
         face.setColorAt(1.0 - STATUSBAR_H / band_h, floor)
         face.setColorAt(1.0, floor)
         p.setBrush(face)
-        p.drawRect(band)
+        p.drawRect(
+            QRectF(
+                float(SIDEBAR_W),
+                band_top,
+                float(self.width() - SIDEBAR_W),
+                band_h - STATUSBAR_H,
+            )
+        )
+        p.drawRect(
+            QRectF(0.0, float(self.height() - STATUSBAR_H), float(self.width()), float(STATUSBAR_H))
+        )
         # 底部内阴影：交代材质下沉，玻璃不是一块平板。
         # 它压着状态栏文字，所以不透明度是令牌（BOTTOM_SHADE），要跟对比度一起调。
         shade = QLinearGradient(0.0, self.height() * 0.72, 0.0, float(self.height()))

@@ -9,6 +9,7 @@
 - 图片口：每张缩略图都有删除键，删除只影响列表与待发送队列；
 - 移动：拖窗口期间不降级材质（亚克力一路都在，桌面在玻璃底下跟着走）；
 - 对比度：深色文字按「最暗底」、白色字形按「最亮底」校准，达 WCAG AA。
+- 空态：图片口裸透（自己不画任何东西），亮字只有一档不透明度、周围不垫任何东西。
 """
 
 from __future__ import annotations
@@ -302,7 +303,7 @@ def main() -> int:
     page_bg = _flatten(styles.CARD, styles.SIDEBAR_FACE, floor_bg)      # + 文字区薄面（侧栏 / 顶栏）
     status_bg = _flatten(styles.CARD, styles.STATUSBAR_FACE, floor_bg)  # 状态栏：同一层薄面
     worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0, status_bg)  # + 底部内阴影
-    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 文字区薄面 + 底影 = #9B9B9D", worst == "#9B9B9D", worst)
+    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 文字区薄面 + 底影 = #8F9090", worst == "#8F9090", worst)
     # 顶栏亮 → 内容中 → 状态栏沉：底影得看得见，但薄面厚到不吃掉 AA（上面那条就是它）。
     check("状态栏仍比侧栏沉一档（底影在起作用）",
           _contrast(styles.TEXT, worst) < _contrast(styles.TEXT, page_bg))
@@ -315,12 +316,21 @@ def main() -> int:
     ):
         ratio = _contrast(color, worst)
         check(f"{name} {ratio:.2f}:1 ≥ {floor}", ratio >= floor)
-    # 图片口是整窗最透的一处：裸玻璃压不住深色文字，所以空态自带一小片柔光池 ——
-    # 这两条要成对看：上面那条不足 AA，下面那条才是空态文字站得住的原因。
-    bare = _contrast(styles.TEXT, floor_bg)
-    pool = _flatten(styles.CARD, styles.POOL_ALPHA, floor_bg)
-    check(f"最透处裸玻璃 {bare:.2f}:1 不足 AA ⇒ 空态必须自带光池",
-          bare < 4.5 and _contrast(styles.TEXT, pool) >= 4.5, f"{bare:.2f} / {pool}")
+    # 图片口是整窗最透的一处：深色文字在这儿根本压不住（上面那条就是它），所以空态提示走
+    # 参考图（iOS「Clear」面板）那条路 —— **亮字、只有一档不透明度**，周围不垫任何东西。
+    # 参考图里那行白字就是直接压在墙上，靠字号 / 字重立层级，不是靠加底。加底反而会在
+    # 这块玻璃上浮出一片灰（深色桌面上尤其显眼），正是本轮要拿掉的东西。所以这里不再校
+    # 比值 —— 亮字压在亮壁纸上天然低对比，那是刻意的 —— 只守两条：一档不透明度、不带底。
+    bare_dark = _contrast(styles.TEXT, floor_bg)
+    check(f"最透处裸玻璃上深色文字 {bare_dark:.2f}:1 站不住 ⇒ 空态提示走亮字", bare_dark < 4.5,
+          f"{bare_dark:.2f}")
+    check("空态只有一档不透明度：大标题 / 副行同取 HINT_TEXT（差的只是字号）",
+          re.search(r"QLabel#emptyMain, QLabel#emptySub \{ color: %s; background: transparent; \}"
+                    % re.escape(styles.HINT_TEXT), styles.QSS) is not None,
+          styles.HINT_TEXT)
+    check("空态周围不垫任何东西：衬底 / 光晕 / 内衬距令牌都已删",
+          not any(hasattr(styles, name) for name in
+                  ("HINT_SCRIM", "HINT_HALO", "HINT_FEATHER", "HINT_PAD_X", "HINT_PAD_Y")))
     # 设备行悬停是**亮**一档（悬停 = 更靠近手指 = 光更足），不是压暗 —— 行内是次要文字，
     # 压暗会把它先推到 AA 以下。
     hover_bg = _flatten(styles.CARD, styles.ROW_HOVER_FACE, page_bg)
@@ -657,21 +667,62 @@ def main() -> int:
     material.attach(1, styles.GLASS_TINT_ABGR)
     check("材质首选纯模糊（系统不掺色，着色 / 加厚 / 高光全由我们自己画）",
           wanted == [ui_glass.ACCENT_ENABLE_BLURBEHIND], str(wanted))
-    # ⑦ 大面板不铺面：整窗与图片口任何一层都不许有光泽带 / 镜面热点 ——
-    #    一块几万像素的板，柔光铺开就是一片奶白，那正是「糊」。
+    # ⑦ 大面板不铺面：整窗任何一层都不许有光泽带 / 镜面热点 —— 一块几万像素的板，
+    #    柔光铺开就是一片奶白，那正是「糊」。**指针光只归窗口外壳**：图片口里一层玻璃
+    #    也不画（既没有光泽 / 镜面热点，也没有跟着光位转的那圈受光薄光）。
     faces: list = []
     glows: list = []
     real_paint, real_glow = mw.paint_glass, mw.paint_edge_glow
     mw.paint_glass = lambda p, r, rad, **kw: faces.append(kw)
     mw.paint_edge_glow = lambda p, r, rad, **kw: glows.append(kw)
     window.paintEvent(None)
+    shell_faces, shell_glows = len(faces), len(glows)
+    window._image_port._empty_state.setVisible(True)
     window._image_port.paintEvent(None)
+    port_faces, port_glows = len(faces) - shell_faces, len(glows) - shell_glows
     mw.paint_glass, mw.paint_edge_glow = real_paint, real_glow
-    check("整窗 + 图片口都不铺光泽 / 镜面热点（大面板只沿边给光）",
-          bool(faces) and all(kw.get("gloss") is False and kw.get("specular") is False for kw in faces),
-          str(faces))
+    check("整窗不铺光泽 / 镜面热点（大面板只沿边给光）",
+          shell_faces > 0
+          and all(kw.get("gloss") is False and kw.get("specular") is False for kw in faces[:shell_faces]),
+          str(faces[:shell_faces]))
+    check("指针光只在窗口外壳上：图片口里一层玻璃也不画", port_faces == 0 and port_glows == 0,
+          f"{port_faces} / {port_glows}")
     check("受光边那圈薄光真的画在窗口上（跟着全局光位）",
-          len(glows) == 1 and glows[0].get("light") is None, str(glows))
+          shell_glows == 1 and glows[0].get("light") is None, str(glows))
+    # 图片口现在是**裸透**：它自己不画任何东西 —— 没有托盘洗、没有光池、没有描边。空态那
+    # 两行亮字是**子控件**画的，且不带底 / 框 / 滤镜。于是「该有的像素」只剩中间一小块，
+    # 四角 / 四边必须是 0：铺满整块的洗、或一大片光池（在 13% 的玻璃上就是中间一团发灰的
+    # 光晕，上一轮用户点名的那个），都会在这两条上露馅。
+    port_shot = QImage(window._image_port.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    port_shot.fill(QColor(0, 0, 0, 0))
+    window._image_port.render(port_shot)
+    port_w, port_h = port_shot.width(), port_shot.height()
+    lit_box: list | None = None
+    lit_px = 0
+    for py in range(0, port_h, 2):
+        for px in range(0, port_w, 2):
+            if port_shot.pixelColor(px, py).alpha() > 6:
+                lit_px += 1
+                if lit_box is None:
+                    lit_box = [px, py, px, py]
+                else:
+                    lit_box = [min(lit_box[0], px), min(lit_box[1], py),
+                               max(lit_box[2], px), max(lit_box[3], py)]
+    rim_alpha = max(
+        port_shot.pixelColor(5, 5).alpha(),
+        port_shot.pixelColor(port_w - 6, port_h - 6).alpha(),
+        port_shot.pixelColor(port_w // 2, 4).alpha(),
+        port_shot.pixelColor(4, port_h // 2).alpha(),
+    )
+    check("图片口裸透：四角 / 四边一个像素都不画（没有托盘洗 / 光池 / 描边）",
+          rim_alpha == 0, str(rim_alpha))
+    check("图片口里只有中间那一小块有像素（空态图标 + 两行字）",
+          lit_box is not None and lit_px * 4 <= port_w * port_h * 0.30
+          and lit_box[0] > port_w * 0.12 and lit_box[2] < port_w * 0.88,
+          f"{lit_box} / {lit_px * 4}px")
+    check("空态两行字不带任何底 / 框 / 滤镜（没有 QGraphicsEffect 托底）",
+          window._image_port._empty_state.graphicsEffect() is None,
+          str(window._image_port._empty_state.graphicsEffect()))
     check("弹层里的移动也算本窗口的（Qt.Popup 是顶层窗口，isAncestorOf 认不出来）",
           window._owns(window._menu) and window._owns(window._send_btn) and not window._owns(app))
 

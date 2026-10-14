@@ -64,6 +64,8 @@ from .styles import (
     GLASS_LIGHT_SHIFT,
     GLASS_RIM_BOTTOM,
     GLASS_RIM_TOP,
+    GLASS_RIM_WIDTH,
+    GLASS_RING,
     GLASS_SQUASH,
     GLASS_SPECULAR,
     LIGHT_TICK_MS,
@@ -309,6 +311,15 @@ def paint_glass(
 
     # 7) 镜面边缘光：沿光轴渐变 —— 光源那侧受光、另一侧背光
     if rim:
+        # 7a) 不随光位变的底子：参考实现那圈 `0 0 0 0.5px rgba(255,255,255,.5) inset`。
+        #     它保证窗口轮廓在任何光位下都立得住 —— 光位只管「哪一段更亮」。
+        if GLASS_RING > 0:
+            pen = QPen(QColor(255, 255, 255, round(255 * GLASS_RING * lit)))
+            pen.setWidthF(GLASS_RIM_WIDTH)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+        # 7b) 受光的那一段：细发丝（0.75px + 抗锯齿 ≈ 眼里的一根亮线）
         light_side, shade_side = _light_axis(rect, light)
         edge = QLinearGradient(light_side, shade_side)
         edge.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_RIM_TOP * lit)))
@@ -316,7 +327,7 @@ def paint_glass(
         edge.setColorAt(1.0, QColor(255, 255, 255, round(255 * GLASS_RIM_BOTTOM * lit)))
         pen = QPen()
         pen.setBrush(edge)
-        pen.setWidthF(1.0)
+        pen.setWidthF(GLASS_RIM_WIDTH)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
