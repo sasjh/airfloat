@@ -62,7 +62,7 @@ from .styles import (
     GLASS_EDGE_GLOW_WIDTH,
     GLASS_GLOSS,
     GLASS_INNER_SHADOW,
-    GLASS_LIGHT_EASE,
+    GLASS_LIGHT_OMEGA,
     GLASS_LIGHT_REST,
     GLASS_LIGHT_SETTLE,
     GLASS_LIGHT_SHIFT,
@@ -116,8 +116,9 @@ class LightField(QObject):
     """全局指针光：**一整个界面只有一个光源**。
 
     光位是归一化方向（-1..1，相对所在窗口的中心）：指针在哪，光就从哪来。
-    指针每动一下只跟 ``GLASS_LIGHT_EASE`` 一小步（30fps 心跳），所以光「跟过来」
-    而不是瞬移 —— 那一点点延迟就是玻璃里液体的黏度。
+    跟随是一条**临界阻尼弹簧**（位置 + 速度，`GLASS_LIGHT_OMEGA`），不是「每心跳挪固定
+    比例」：比例跟随在指针拐弯时**速度会突变**（看到的就是一道折角），而弹簧的速度连续 ——
+    起步从 0 加速、末段自然收住，那点延迟就是玻璃里液体的黏度。
     """
 
     moved = Signal()
@@ -126,7 +127,9 @@ class LightField(QObject):
         super().__init__()
         self._current = QPointF(*GLASS_LIGHT_REST)
         self._target = QPointF(*GLASS_LIGHT_REST)
+        self._velocity = QPointF(0.0, 0.0)
         self._clock = QElapsedTimer()
+        self._clock.start()
         self._timer = QTimer(self)
         self._timer.setInterval(LIGHT_TICK_MS)
         self._timer.timeout.connect(self._step)
@@ -150,18 +153,35 @@ class LightField(QObject):
             self._timer.start()
 
     def _step(self) -> None:
-        # 按**真实间隔**归一：掉帧时这一步就大一点，光不会因为卡了一下而走成一段一段的
-        # （心跳固定 16ms 只是「最密的步子」，不是「必须等 16ms」）。上限 100ms：真卡了
-        # 宁可多花几帧追上，也不要一步跳到指针那儿 —— 那一下就是「瞬移」，黏度就没了。
-        dt = max(1.0, min(float(self._clock.restart()), 100.0))
-        ease = 1.0 - (1.0 - GLASS_LIGHT_EASE) ** (dt / LIGHT_TICK_MS)
+        # 按**真实间隔**推进：掉帧那一步就多走一点，光不会因为卡了一下而走成一段一段
+        # （8ms 心跳只是采样密度，不是「必须等 8ms」）。上限 100ms：真卡了宁可多花几帧
+        # 追上，也不要一步跳到指针那儿 —— 那一下就是「瞬移」，黏度就没了。
+        dt = max(1.0, min(float(self._clock.restart()), 100.0)) / 1000.0
+        self._advance(dt)
         delta = self._target - self._current
         if abs(delta.x()) < GLASS_LIGHT_SETTLE and abs(delta.y()) < GLASS_LIGHT_SETTLE:
             self._current = QPointF(self._target)
+            self._velocity = QPointF(0.0, 0.0)
             self._timer.stop()
-        else:
-            self._current += delta * ease
         self.moved.emit()
+
+    def _advance(self, dt: float) -> None:
+        """临界阻尼弹簧走一步（**解析解**，不是逐步欧拉）。
+
+        误差 e = 目标 - 当前，速度记在位置这一侧：临界阻尼下
+        ``e(t) = (e0 + (ė0 + ω·e0)·t) · e^(-ω·t)``。
+        用解析解而不是欧拉：欧拉在 dt 大一点（掉一帧、或系统休眠刚回来）时会**发散**，
+        玻璃上的光会突然抖一下甚至飞出去；解析解对任意 dt 都稳。
+        """
+        omega = GLASS_LIGHT_OMEGA
+        error = self._target - self._current          # 位置误差
+        rate = -self._velocity                        # 误差的导数
+        slope = rate + error * omega
+        decay = math.exp(-omega * dt)
+        error_new = (error + slope * dt) * decay
+        rate_new = (slope - (error + slope * dt) * omega) * decay
+        self._current = self._target - error_new
+        self._velocity = -rate_new
 
 
 _LIGHT_FIELD: LightField | None = None

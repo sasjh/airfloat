@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -644,6 +645,27 @@ def main() -> int:
     QTest.qWait(700)
     check("指针光最终跟上（热点落到指针那一侧）",
           field.direction.x() > 0.5 and field.direction.y() > 0.5, str(field.direction))
+    # ⑤ 光的**起步**必须是从 0 加速出来的：等比跟随（旧写法）第一步就是最大的一步 ——
+    #    那一下就是「一拍就到」；临界阻尼弹簧的速度从 0 起，中段最快、末段自己收住。
+    probe = ui_liquid.LightField()
+    probe._current = QPointF(*styles.GLASS_LIGHT_REST)
+    probe._target = QPointF(0.9, 0.9)
+    probe._velocity = QPointF(0.0, 0.0)
+    steps: list = []
+    trail: list = []
+    for _ in range(150):
+        before = probe.direction
+        probe._advance(0.008)
+        after = probe.direction
+        steps.append(math.hypot(after.x() - before.x(), after.y() - before.y()))
+        trail.append(after.x())
+    check(f"光起步最柔：第一步不是最大的一步（{steps[0]:.4f} < 最大 {max(steps):.4f} 的 1/3）",
+          steps[0] < max(steps) / 3, f"{steps[0]:.5f} vs {max(steps):.5f}")
+    check("光不会闯过目标（临界阻尼：单调逼近，没有过冲）",
+          all(b >= a - 1e-9 for a, b in zip(trail, trail[1:])) and abs(trail[-1] - 0.9) < 1e-3,
+          f"{trail[-1]:.5f}")
+    check(f"末段自己收住（最后一小步 {steps[-1]:.5f} < 最大步的 1/20）",
+          steps[-1] < max(steps) * 0.05, f"{steps[-1]:.6f} vs {max(steps):.5f}")
     # ④ 内容环境光：只借色调（保色相 / 降饱和 / 夹明度），不能变成彩色塑料
     def borrow(fill: str) -> QColor:
         pixmap = QPixmap(8, 8)
@@ -753,6 +775,14 @@ def main() -> int:
         jumps.extend(abs(b - a) for a, b in zip(line, line[1:]))
     check(f"薄光过渡是连续的（扫描线上相邻落差最大 {max(jumps)}/255 ≤ 12）", max(jumps) <= 12,
           str(max(jumps)))
+    # 光还要**小**：亮的地方必须全贴在受光边的一条窄带里 —— 光一大就不是「光」，是「面」。
+    # 上一版（20px 带 + 0.35 半径的柔光）能摸到玻璃里 16px 深、点亮 934 个像素；这一版
+    # （12px + 0.22）是 8px、468 个像素 —— 面积砍掉一半，峰值也从 35/255 收到 22/255。
+    lit = [(x, y) for y in range(40) for x in range(80) if glow_rest.pixelColor(x, y).alpha() > 3]
+    lit_depth = max(y for _, y in lit)
+    check(f"光很小：受光边那条亮带最深只到 {lit_depth}px（≤ 12）", lit_depth <= 12, str(lit_depth))
+    check(f"光很小：整片玻璃只有 {len(lit)} 个像素被点亮（≤ 600 / 共 3200）", len(lit) <= 600,
+          str(len(lit)))
     # 图片口现在是**裸透**：它自己不画任何东西 —— 没有托盘洗、没有光池、没有描边。空态那
     # 两行亮字是**子控件**画的，且不带底 / 框 / 滤镜。于是「该有的像素」只剩中间一小块，
     # 四角 / 四边必须是 0：铺满整块的洗、或一大片光池（在 13% 的玻璃上就是中间一团发灰的
