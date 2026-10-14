@@ -2,16 +2,17 @@
 
 设计依据：Apple 设计原则（技能 `apple-design`，WWDC 设计演讲）。
 
-毛玻璃版的四条主线：
-- **低透毛玻璃**：材质面要「实」到压得住背后的杂色 —— 内容（照片 / 文件名 / 正文）
-  坐在低透的浅色面上，绝不让桌面颜色从字底下透上来。通透感交给光影去换，不靠更透明。
+毛玻璃版的五条主线：
+- **低透 + 局部加厚**：整窗只着色 44%，桌面真的从玻璃底下上得来；有字的区域各自垫一层
+  薄面，把该区的亮度下限抬回 AA；图片口这种大块内容保持**真透**。通透感来自「大面积
+  真透 + 小面积厚度」的对比，不是把整窗调实 —— 整窗调实就是把桌面挡回去（那才是「糊」）。
 - **玻璃只做点缀**：只有「能摸的东西」套液态玻璃光影（按钮 / 菜单 / 窗口外壳 / 浮层）；
   内容是内容 —— 照片瓦片、设备行一律安静（低透面 + 发丝线），不跟主操作抢戏。
 - **渐变光影出声，分割线闭嘴**：顶栏受光 → 内容居中 → 状态栏下沉，一档亮一档中一档深，
-  层次由光来讲；区域之间不画硬线。整窗那一层「铺满上半屏的光泽带」已撤掉（那是奶膜 = 糊）。
-- **对比按最差底校准**：文字不按白底校准，而按「材质最暗处」逐层压出来 —— 亚克力着色
-  `BG #EAF4FF` @68% 压纯黑桌面 = `#9FA6AD`，再叠最重的结构洗（侧栏）+ 窗口底部内阴影
-  = `#92999F`。所有文字按它达标（≥ 4.5:1），每项注真实测对比度。
+  层次由光来讲；区域之间不画硬线（薄面一律带渐隐，不留硬边）。
+- **对比按最差底校准**：文字不按白底校准，而按「材质最暗处」逐层压出来 —— 着色
+  `BG #EAF4FF` @44% 压纯黑桌面 = `#676B70`，再叠文字区薄面 = `#9B9DA1`，再叠窗口
+  底部内阴影 = `#97999D`。所有文字按它达标（≥ 4.5:1），每项注真实测对比度。
 - **用光表现厚度**：顶边受光（rim highlight）+ 底部内阴影交代材质厚度。
 """
 
@@ -23,19 +24,40 @@ from PySide6.QtGui import QColor, QFont
 
 # ---------- 材质（毛玻璃）----------
 # 亚克力着色：Windows 的 ACCENT_ENABLE_ACRYLICBLURBEHIND 取 ABGR 整数。
-# 0xAD = 173 = 68%。实测（深色壁纸）：68% 时内容区 = #AAADB1，100% 才 #D8DDE3 ——
-# 68% 已经「低透」到文字随便读，再往下压才是糊。着色越实越不干扰文字，也越像磨砂膏。
-GLASS_TINT_ABGR = 0xADFFF4EA
+# 0x29 = 41 = 16%：**几乎全透** —— 壁纸的色与影整片上得来，窗口像一片立在桌面上的玻璃。
+# 代价是字形底下的亮度下限跟着掉，所以「读得清」不再由整窗一个人扛：有字的区域各自
+# 垫一层薄面（见下面的 FACE 一组），图片口这种大块内容保持真透。
+# 着色每往下压一档，薄面就得往上补一档 —— 这是一对，动一个必须动另一个（见 test_ui §13）。
+GLASS_TINT_ABGR = 0x29FFF4EA
 GLASS_SURFACE = 0.72           # 浅材质面（内容 / 控件）白色不透明度（低透：压得住背后杂色）
-GLASS_SURFACE_HOVER = 0.88     # 悬停：面更实 = 更靠近手指（不是更透明）
-GLASS_SURFACE_PRESSED = 0.52   # 按下：反馈发生在按下瞬间
-RAIL_ALPHA = 0.06              # 侧栏：更重的材质，用来分隔结构分区（越重，栏内文字对比度越低）
+# 控件玻璃（按钮 / 卡片这类「能摸的东西」）：比内容面**透**得多 —— 半透才有呼吸感。
+# 内容面负责「看得清」，控件面负责「像玻璃」，两套材质各司其职，别互相将就。
+CONTROL_GLASS = 0.42           # 控件玻璃：静息
+CONTROL_GLASS_HOVER = 0.54     # 悬停：更实一档 = 更靠近手指
+CONTROL_GLASS_PRESSED = 0.30   # 按下：更透 = 反馈发生在按下瞬间
+# ---------- 文字区薄面（低透 + 局部加厚）----------
+# 三处薄面同一分量：同一套材质不该因为位置不同而厚薄不一。薄面都带渐隐
+# （FACE_FALLOFF），所以分区之间是「光在变」，不是一条硬边。
+SIDEBAR_FACE = 0.56            # 侧栏（结构分区）：材质最亮的一档 —— 靠更亮分区，不靠描边
+TOPBAR_FACE = 0.56             # 顶栏：受光带的地板（再往上叠 TOPBAR_SHEEN）
+STATUSBAR_FACE = 0.56          # 与另两处同价：薄面够厚时，那道底影只是「沉一档」，不再吃掉 AA
+FACE_FALLOFF = 1.8             # 薄面高度 = 该栏高度 × 它，向内容区渐隐到 0
+# 光池只要托住那行字：铺得太开（圆形）在 16% 的玻璃上就是一块看得见的灰斑，
+# 那正是「透」的反面。所以它是**扁的** —— 横着裹住整行字，竖着只覆盖一个字高，
+# 上下两端让图片口保持真透。值由「压纯黑桌面」这一最差情形推出（见 §13）。
+POOL_ALPHA = 0.48              # 图片口空态：一片扁柔光 —— 空态文字自带底，不用糊硬面
+POOL_CORE = 0.45               # 光池：这个半径比例以内保持满强度（要盖住整行字的宽度）
+POOL_MID = 0.75                # 光池外圈的过渡起点：再往外就快速淡掉
+POOL_MID_ALPHA = 0.25          # 过渡处的强度比例 —— 没有这一档，池子会露出一圈看得见的椭圆边
+POOL_RX = 0.62                 # 光池横半径 = 它 × 图片口宽
+POOL_RY = 0.30                 # 光池纵半径 = 它 × 图片口高
 WELL_ALPHA = 0.05              # 图片口：极轻的凹陷托盘，只做「这里是容器」的暗示
-CHIP_ALPHA = 0.06              # 一次性轻底：列表行悬停 / 缩略图占位
+CHIP_ALPHA = 0.06              # 一次性深色轻底：缩略图占位（压在浅色瓦片上）
+ROW_HOVER_FACE = 0.12          # 设备行悬停：**亮**一档（悬停 = 更靠近手指 = 光更足）
 HAIRLINE_ALPHA = 0.16          # 发丝线（缩略图轮廓等）
-RECESS_WASH = "#0C0E12"        # 结构分区 / 托盘的基色（深色洗）
+RECESS_WASH = "#0C0E12"        # 托盘 / 凹槽 / 深色片的基色（深色洗）
 BOTTOM_SHADE = 8               # 窗口底部内阴影不透明度 /255（越重，状态栏文字越暗）
-TOPBAR_SHEEN = 0.10            # 顶栏受光带（渐变光影：顶栏亮 → 内容中 → 状态栏深）
+TOPBAR_SHEEN = 0.10            # 顶栏最上沿再亮一档（光从上面来：顶栏亮 → 内容中 → 状态栏深）
 MENU_BG = "#1C1D22"            # 弹出菜单：深色材质
 MENU_ALPHA = 0.94
 MENU_ROW_HOVER = 26 / 255      # 菜单行悬停底（白色）
@@ -46,22 +68,61 @@ MENU_ROW_PRESSED = 46 / 255    # 菜单行按下底（更实 = 反馈发生在�
 # （背后的桌面由 DWM 在窗口之外合成），这里移植的是光影结构：边缘光 / 光泽 /
 # 镜面热点 / 边缘色差 / 内阴影 / 落影。绘制入口在 liquid.paint_glass()。
 GLASS_RIM_TOP = 0.86           # 受光边（左上）镜面强度
-GLASS_RIM_BOTTOM = 0.20        # 背光边（右下）
+GLASS_RIM_BOTTOM = 0.46        # 背光边（右下）：不能太暗 —— 一整圈亮边才是玻璃的签名
 GLASS_GLOSS = 0.30             # 顶部光泽带
 GLASS_SPECULAR = 0.42          # 左上角镜面热点
 GLASS_ABERRATION = 0.18        # 边缘色差（冷 / 暖各偏 1px）
 GLASS_INNER_SHADOW = 0.10      # 按下：玻璃压进去的内阴影
+
+# ---------- 指针光（让玻璃「活着」）----------
+# 一整块界面共用**一个光源**：指针在哪，光就从哪来 —— 所有玻璃的高光方向因此一致。
+# 指针每动一下只跟一小步，所以高光是「跟过来」的，不是瞬移；这一点点延迟就是
+# 「有生命的液体」和「一张贴纸」的区别。
+GLASS_LIGHT_REST = (-0.72, -0.72)  # 静息光位（左上）：没有指针时的设计约定
+GLASS_LIGHT_EASE = 0.30            # 每次跟进的比例（越小越「懒」）
+LIGHT_TICK_MS = 33                 # 光场心跳：跟手但不必跟满帧（30fps 足够顺，也省下重绘）
+GLASS_LIGHT_SHIFT = 0.35           # 镜面热点：从光源侧边缘朝玻璃中心挪这个比例（0 = 贴边）
+GLASS_CAUSTIC = 0.20               # 背光侧的焦散细弧：光穿过玻璃，在另一侧聚成一道亮边
+GLASS_CAUSTIC_INSET = 2.0          # 焦散弧离边缘多远（px）
+GLASS_EDGE_GLOW = 0.16             # 受光边那圈内圈薄光：大面板只给「边」给光，不给面
+GLASS_EDGE_GLOW_WIDTH = 26.0       # 内圈薄光的宽度（px）：**像素**不是比例，放大不会糊成一片
+GLASS_SQUASH = 0.55                # 按下的各向异性：纵向压多少，横向就鼓多少（0 = 各向同性）
+
+# ---------- 内容的环境光（玻璃被内容染色）----------
+# 收到的照片把自己的颜色借给玻璃一点：新图进来，整片玻璃慢慢染过去。
+# 只借一点点 —— 玻璃不能变成彩色塑料。
+AMBIENT_MIX = 0.55                 # 内容色保留多少饱和度（其余归中性）
+AMBIENT_ALPHA = 0.13               # 环境光那层光的强度
+AMBIENT_SETTLE_MS = 850            # 染色渐变的时间
+AMBIENT_DIP = 0.45                 # 再来一张图时先退到当前强度的这个比例，再重新染上去（呼吸）
+AMBIENT_SPREAD = 0.90              # 染光半径 / 窗口长边
+AMBIENT_VALUE_FLOOR = 0.45         # 染光明度下限：太暗的照片不能把底压到吃掉 AA
+AMBIENT_VALUE_CEIL = 0.85          # 染光明度上限：太亮的照片不许把玻璃洗白
 
 # 高光强度：**只有这一张表**，各处不再写 lit= 字面量（见 docs/03 §2.2）。
 # 面积越大，高光越要克制（拉满就发灰发糊）；越小的控件越敢亮。
 GLASS_LIT_REST = 1.00          # 静息
 GLASS_LIT_HOVER = 1.12         # 悬停：光更足 = 更靠近手指
 GLASS_LIT_PRESSED = 0.90       # 按下：光收回去（配合内阴影）
-GLASS_LIT_WINDOW = 0.55        # 整窗：面积大，高光拉满会发灰发糊
+GLASS_LIT_WINDOW = 0.72        # 整窗：面积大，高光要克制；但太弱那圈细亮边就立不住
 GLASS_LIT_LENS = 0.55          # 小透镜（隔空投送圆钮）：只压一层，别像贴纸
 GLASS_LIT_MENU = 0.80          # 深色菜单面：高光太亮会把白字对比度拉下来
 GLASS_LIT_MENU_ROW = 0.70      # 菜单行悬停片
 
+# ---------- 凹槽环玻璃（参考图那枚圆钮 / 胶囊：细描边 + 弱阴影 + 半透）----------
+# 和上面的液态玻璃分工不同：它**不铺浅色面** —— 槽底只是一层半透的底座色
+# （背后的亚克力模糊能透上来，玻璃才像在呼吸）；立体感全靠一圈发丝环 + 顶内阴影
+# + 底内受光。槽底的实与不实，取决于它压着什么颜色的字形 ——
+# 所以槽底的不透明度不在这一组里，跟着它的底色走（见下面的 SEND_WELL）。
+RING_EDGE_TOP = 0.70           # 发丝环上缘
+RING_EDGE_BOTTOM = 0.95        # 发丝环下缘（参考图里下缘最亮 —— 那是反光）
+RING_FILL_TOP = 1.22           # 槽底渐变：顶部（凹进去那侧）最实
+RING_FILL_FLOOR = 0.82         # 槽底渐变：底部最浅 —— 也是字形脚下最亮的一档，对比度按它算
+RING_TOP_SHADE = 0.26          # 顶内阴影（凹）
+RING_BOTTOM_LIGHT = 0.34       # 底内受光（反光）：只贴边那一条，不铺到字形下面
+RING_LIGHT_TOP = 0.80          # 底内受光带的起点：0.80 正好落在字形盒之下（见 test_ui）
+RING_SHADOW = 0.22             # 环外那条弱落影
+RING_INSET = 1.0               # 凹槽内缩 1px：把外缘那 1px 留给环外的弱落影
 
 def wash(alpha: float, base: str = RECESS_WASH) -> QColor:
     """深色洗：结构分区 / 托盘 / 发丝线统一走这里，避免各处随手写 alpha。"""
@@ -95,10 +156,11 @@ TEXT_SECONDARY = "#28303A"    # 次要文字（最差底 4.62:1，≥ AA 4.5:1�
 ACCENT = "#2E6CB0"            # 强调色：其上白字 5.40:1
 ACCENT_HOVER = "#2A61A0"
 ACCENT_PRESSED = "#24568F"
-# 「发送」按钮的强调色玻璃：不透明度阶梯，每档都按最差底验过其上白字
-ACCENT_GLASS_REST = 0.94       # 常态白字 5.20:1
-ACCENT_GLASS_HOVER = 0.96      # 悬停白字 6.16:1
-ACCENT_GLASS_PRESSED = 0.98    # 按下白字 7.39:1
+# 「发送」键的凹槽底（强调色）：主操作要立得住，所以比控件玻璃实得多 ——
+# 白箭头压在它上面必须 ≥3:1（图标底线），三档都按最亮底（纯白壁纸）验过。
+SEND_WELL = 0.90               # 常态
+SEND_WELL_HOVER = 0.94         # 悬停：更实一档 = 更靠近手指
+SEND_WELL_PRESSED = 0.96       # 按下：槽更深（回弹交给 PressSpring）
 ACCENT_ICON = "#1568C8"       # 图标底（隔空投送圆钮）：其上白色字形 5.46:1
 OFFLINE = "#6B7280"           # 关闭态圆钮：其上白色字形 4.82:1
 SUCCESS = "#08331F"           # 成功（文字用，最差底 4.84:1）
@@ -107,11 +169,12 @@ DANGER = "#B3403C"            # 错误填充（其上的白字 5.62:1）
 DANGER_HOVER = "#9C3532"
 
 # 玻璃片：tone 名 -> (底色, 不透明度)。图标按钮的底色表（静息 / 悬停各取一档）。
+# 「light」是悬停片：走控件玻璃那一档（半透），玻璃才有呼吸感；字形是深色的，
+# 面越浅对比越高，所以控件面透一点不影响可读性。
 # 「dark」是压在**任意照片**上的遮罩片：取 0.58 才能让白字形在纯白照片上仍有
 # 4.74:1（≥3:1 是图标底线）；0.30 那种轻玻璃会把白色字形洗掉。
 TONE_MATERIALS: dict[str, tuple[str, float]] = {
-    "light": ("#FFFFFF", GLASS_SURFACE),
-    "bright": ("#FFFFFF", GLASS_SURFACE_HOVER),
+    "light": ("#FFFFFF", CONTROL_GLASS_HOVER),
     "dark": ("#0C0E12", 0.58),
     "danger": (DANGER, 0.92),
     "danger_deep": (DANGER_HOVER, 0.96),
@@ -160,7 +223,6 @@ TYPE: dict[str, tuple[int, int, float]] = {
     "cardValue": (12, 400, 0.2),   # 模块卡片取值行（所有人 ⌄）
     "menuRow": (14, 400, -0.1),    # 弹出菜单行（大字号收紧字距）
     "emptyTitle": (14, 600, 0.0),
-    "emptyBody": (12, 400, 0.2),
     "status": (11, 400, 0.3),      # 状态栏
     "button": (13, 600, 0.0),
     "toast": (12, 500, 0.2),
@@ -256,12 +318,10 @@ QFrame#sidebar {{ background: transparent; }}
 QLabel#groupTitle {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QListWidget#deviceList {{ background: transparent; border: none; outline: none; }}
 QListWidget#deviceList::item {{ background: transparent; }}
-QLabel#deviceEmpty {{ color: {TEXT_SECONDARY}; background: transparent; }}
 
 /* ---------- 图片口（极轻的凹陷托盘）---------- */
 QFrame#imagePort {{ background: transparent; }}
 QLabel#emptyMain {{ color: {TEXT}; background: transparent; }}
-QLabel#emptySub {{ color: {TEXT_SECONDARY}; background: transparent; }}
 QLabel#dropOverlay {{
     border: 2px dashed {ACCENT};
     border-radius: {RADIUS_CARD}px;
@@ -279,7 +339,8 @@ QPushButton#sendBtn {{
     color: #FFFFFF;
     border: none;
 }}
-/* 「发送」按钮是强调色液态玻璃，面由 _SendButton.paintEvent 画（含悬停 / 按下 / 回弹）。 */
+/* 「发送」是强调色凹槽环玻璃圆钮：面与那圈发丝环都由 _SendButton.paintEvent 画
+   （含悬停 / 按下 / 回弹）。这里只留一个透明底，任何底色都会挡住玻璃。 */
 QProgressBar#sendProgress {{ background: {white_css(0.55)}; border: none; border-radius: 3px; }}
 QProgressBar#sendProgress::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 

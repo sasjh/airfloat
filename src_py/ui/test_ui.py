@@ -2,12 +2,13 @@
 """AirFloat 浮窗 UI 自测（离屏运行：``python src_py/ui/test_ui.py``）。
 
 守住的是「看得见的承诺」：
-- 材质：窗口是真实的桌面模糊（亚克力）+ 圆角裁剪，拿不到时降级为纯色薄膜；
+- 材质：窗口是真实的桌面模糊（纯模糊，不掺系统乳白）+ 圆角裁剪，拿不到时降级为纯色薄膜；
 - 几何：无边框窗口可八向缩放，守住最小尺寸，列数随宽度变化；
 - 模块卡片：圆钮开关 / 点卡片出菜单，状态与 _state 永远一致；
 - 弹出菜单：三项、勾选行跟随当前取值、选中即回传 receive_mode_changed；
 - 图片口：每张缩略图都有删除键，删除只影响列表与待发送队列；
-- 对比度：文字按「材质最差底」校准，达 WCAG AA。
+- 移动：拖窗口期间不降级材质（亚克力一路都在，桌面在玻璃底下跟着走）；
+- 对比度：深色文字按「最暗底」、白色字形按「最亮底」校准，达 WCAG AA。
 """
 
 from __future__ import annotations
@@ -20,8 +21,17 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QByteArray, QPoint, QRect, QRectF, QSettings, QSize, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QImage, QPainter  # noqa: E402
+from PySide6.QtCore import (  # noqa: E402
+    QByteArray,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSettings,
+    QSize,
+    Qt,
+)
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -74,6 +84,17 @@ def _glass_probe(**kwargs) -> QImage:
     image.fill(QColor(0, 0, 0, 0))
     painter = QPainter(image)
     ui_liquid.paint_glass(painter, QRectF(0.5, 0.5, 79.0, 39.0), 10.0, **kwargs)
+    painter.end()
+    return image
+
+
+def _well_probe(**kwargs) -> QImage:
+    """把一枚凹槽环玻璃画进离屏小图：验证槽底 / 发丝环 / 顶影 / 底光的分布。"""
+    image = QImage(60, 60, QImage.Format.Format_ARGB32)
+    image.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(image)
+    fill = kwargs.pop("fill", styles.SEND_WELL)
+    ui_liquid.paint_well_glass(painter, QRectF(0.5, 0.5, 59.0, 59.0), 29.5, fill=fill, **kwargs)
     painter.end()
     return image
 
@@ -274,13 +295,19 @@ def main() -> int:
     check("Esc 关闭窗口", not window.isVisible())
 
     print("\n[13] 对比度：按材质最差底（玻璃最暗处）校准")
-    # 最差底是「逐层压出来」的，不是写死的：玻璃着色 → 最重的结构洗（侧栏）→ 底部内阴影。
+    # 最差底是「逐层压出来」的，不是写死的：玻璃着色 → 文字区薄面 → 底部内阴影。
     # 三层全部取自令牌，所以动了其中任何一个都会在这里被重新校验，不会悄悄漂移。
     tint_alpha = ((styles.GLASS_TINT_ABGR >> 24) & 0xFF) / 255.0
-    worst = _flatten(styles.BG, tint_alpha, "#000000")          # 玻璃压纯黑桌面
-    worst = _flatten(styles.RECESS_WASH, styles.RAIL_ALPHA, worst)   # 再加侧栏的深色洗
-    worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0, worst)  # 再加底部内阴影
-    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 侧栏洗 + 底影 = #92999F", worst == "#92999F", worst)
+    floor_bg = _flatten(styles.BG, tint_alpha, "#000000")      # 玻璃压纯黑桌面（图片口 = 最透处）
+    page_bg = _flatten(styles.CARD, styles.SIDEBAR_FACE, floor_bg)      # + 文字区薄面（侧栏 / 顶栏）
+    status_bg = _flatten(styles.CARD, styles.STATUSBAR_FACE, floor_bg)  # 状态栏：同一层薄面
+    worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0, status_bg)  # + 底部内阴影
+    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 文字区薄面 + 底影 = #9B9B9D", worst == "#9B9B9D", worst)
+    # 顶栏亮 → 内容中 → 状态栏沉：底影得看得见，但薄面厚到不吃掉 AA（上面那条就是它）。
+    check("状态栏仍比侧栏沉一档（底影在起作用）",
+          _contrast(styles.TEXT, worst) < _contrast(styles.TEXT, page_bg))
+    # 深色文字按 worst（最暗底）校；白色字形反过来按 lightest（最亮底 = 纯白壁纸）校。
+    lightest = _flatten(styles.BG, tint_alpha, "#FFFFFF")
     for name, color, floor in (
         ("主文字 TEXT", styles.TEXT, 4.5),
         ("次要文字 TEXT_SECONDARY", styles.TEXT_SECONDARY, 4.5),
@@ -288,6 +315,18 @@ def main() -> int:
     ):
         ratio = _contrast(color, worst)
         check(f"{name} {ratio:.2f}:1 ≥ {floor}", ratio >= floor)
+    # 图片口是整窗最透的一处：裸玻璃压不住深色文字，所以空态自带一小片柔光池 ——
+    # 这两条要成对看：上面那条不足 AA，下面那条才是空态文字站得住的原因。
+    bare = _contrast(styles.TEXT, floor_bg)
+    pool = _flatten(styles.CARD, styles.POOL_ALPHA, floor_bg)
+    check(f"最透处裸玻璃 {bare:.2f}:1 不足 AA ⇒ 空态必须自带光池",
+          bare < 4.5 and _contrast(styles.TEXT, pool) >= 4.5, f"{bare:.2f} / {pool}")
+    # 设备行悬停是**亮**一档（悬停 = 更靠近手指 = 光更足），不是压暗 —— 行内是次要文字，
+    # 压暗会把它先推到 AA 以下。
+    hover_bg = _flatten(styles.CARD, styles.ROW_HOVER_FACE, page_bg)
+    hover_ratio = _contrast(styles.TEXT_SECONDARY, hover_bg)
+    check(f"设备行悬停底更亮，行内次要文字仍 {hover_ratio:.2f}:1 ≥ 4.5",
+          styles.ROW_HOVER_FACE > 0 and hover_ratio >= 4.5, hover_bg)
     for name, fg, bg, floor in (
         ("强调色上的白字", "#FFFFFF", styles.ACCENT, 4.5),
         ("圆钮白字形", "#FFFFFF", styles.ACCENT_ICON, 3.0),
@@ -318,6 +357,10 @@ def main() -> int:
     check("松手后窗口停在新位置", (window.x(), window.y()) == (240, 185), f"{window.x()},{window.y()}")
 
     print("\n[15] 液态玻璃：光影结构 + 玻璃面接线")
+    # 前面几节用手动鼠标事件做过交互，那会把**指针光**带到别处；量光影之前先回到静息光位
+    # （真实运行时，那正是「指针不在窗口上」时的样子）。
+    light_field = ui_liquid.pointer_light()
+    light_field._current = light_field._target = QPointF(*styles.GLASS_LIGHT_REST)
     # 一层一层验：高光强度可关（lit=0 必须全透明，绝不挡住背后的真实模糊）
     check("lit=0 ⇒ 整块透明（高光强度可控）", _peak_alpha(_glass_probe(lit=0.0), QRect(0, 0, 79, 39)) == 0)
     # 默认只画光影：内部透明、边缘发光 —— 玻璃是「边缘在反光」，不是一块实心贴纸
@@ -361,17 +404,38 @@ def main() -> int:
     spring.release()
     QTest.qWait(260)
     check("松手弹回原尺寸", abs(spring.scale - 1.0) < 1e-6, f"{spring.scale:.3f}")
-    # 玻璃是半透明的：白字压在强调色玻璃上（最差底）也得 ≥ 4.5:1
-    for label, color, alpha in (
-        ("常态", styles.ACCENT, styles.ACCENT_GLASS_REST),
-        ("悬停", styles.ACCENT_HOVER, styles.ACCENT_GLASS_HOVER),
-        ("按下", styles.ACCENT_PRESSED, styles.ACCENT_GLASS_PRESSED),
+    # 发送键不再是文字按钮：白箭头压在强调色槽底上，最亮底（纯白壁纸）也要 ≥ 3:1
+    for label, color, fill in (
+        ("常态", styles.ACCENT, styles.SEND_WELL),
+        ("悬停", styles.ACCENT_HOVER, styles.SEND_WELL_HOVER),
+        ("按下", styles.ACCENT_PRESSED, styles.SEND_WELL_PRESSED),
     ):
-        ratio = _contrast("#FFFFFF", _flatten(color, alpha, worst))
-        check(f"发送键白字（{label}）{ratio:.2f}:1 ≥ 4.5", ratio >= 4.5)
+        # 槽底是上深下浅的渐变：字形脚下最亮的一档是 fill * RING_FILL_FLOOR
+        ratio = _contrast("#FFFFFF", _flatten(color, fill * styles.RING_FILL_FLOOR, lightest))
+        check(f"发送键白箭头（{label}）{ratio:.2f}:1 ≥ 3.0", ratio >= 3.0)
+    check("底内受光只贴边（不爬到箭头下面）",
+          styles.RING_LIGHT_TOP > 0.5 + mw.SEND_GLYPH / 2.0,
+          f"{styles.RING_LIGHT_TOP} vs {0.5 + mw.SEND_GLYPH / 2.0}")
+    # 接线：画的确实是「圆形凹槽环玻璃 + 白色向上箭头」，槽底走 SEND_WELL 令牌
+    drawn: dict = {}
+    real_glyph, real_well = mw.paint_glyph, mw.paint_well_glass
+    mw.paint_glyph = lambda p, name, rect, color: drawn.setdefault(
+        "glyph", (name, QColor(color).name()))
+    mw.paint_well_glass = lambda p, rect, radius, **kw: drawn.setdefault(
+        "well", (rect, radius, kw))
+    window._send_btn.paintEvent(None)
+    mw.paint_glyph, mw.paint_well_glass = real_glyph, real_well
+    well = drawn.get("well")
+    check("发送键是圆形凹槽环玻璃", bool(well) and abs(well[1] - mw.SEND_BTN / 2.0) < 0.01,
+          str(well[1] if well else None))
+    check("发送键的槽底走 SEND_WELL 令牌",
+          bool(well) and well[2].get("fill") == styles.SEND_WELL,
+          str(well[2].get("fill") if well else None))
+    check("发送键画的是白色向上箭头（不再是文字）",
+          drawn.get("glyph") == ("arrow_up", "#ffffff"), str(drawn.get("glyph")))
     # 接线：该用玻璃的地方都用上了；容器不再自己铺底色（否则会挡住玻璃）
     check("侧栏是玻璃底板", isinstance(window.findChild(mw.GlassSurface), mw.GlassSurface))
-    check("发送键是强调色玻璃按钮", isinstance(window._send_btn, mw._SendButton))
+    check("发送键是自绘圆钮（_SendButton）", isinstance(window._send_btn, mw._SendButton))
     check("图标按钮悬挂停玻璃（文件夹 / 关闭）",
           (window._folder_btn._hover_tone, window._close_btn._hover_tone) == ("light", "danger"))
     probe_thumb = mw.ThumbWidget(paths[0], "probe.png")
@@ -392,10 +456,16 @@ def main() -> int:
           and "QPushButton#sendBtn:hover" not in styles.QSS)
 
     print("\n[16] 层级与克制：低透面 / 渐变光影 / 玻璃只做点缀")
-    # ① 材质阶梯：悬停要更「实」（不是更透明），按下退回去
-    check("浅材质面阶梯：悬停 > 静息 > 按下",
-          styles.GLASS_SURFACE_HOVER > styles.GLASS_SURFACE > styles.GLASS_SURFACE_PRESSED,
-          f"{styles.GLASS_SURFACE_HOVER} / {styles.GLASS_SURFACE} / {styles.GLASS_SURFACE_PRESSED}")
+    # ① 两套材质分工：内容面负责「看得清」（实），控件面负责「像玻璃」（透）；
+    #    控件悬停更「实」（不是更透明），按下退回去。
+    check("控件玻璃比内容玻璃透（半透才有呼吸感）",
+          styles.CONTROL_GLASS < styles.GLASS_SURFACE,
+          f"{styles.CONTROL_GLASS} vs {styles.GLASS_SURFACE}")
+    check("材质阶梯：内容面 > 控件悬停 > 控件 > 控件按下",
+          styles.GLASS_SURFACE > styles.CONTROL_GLASS_HOVER > styles.CONTROL_GLASS
+          > styles.CONTROL_GLASS_PRESSED,
+          f"{styles.GLASS_SURFACE} / {styles.CONTROL_GLASS_HOVER} / "
+          f"{styles.CONTROL_GLASS} / {styles.CONTROL_GLASS_PRESSED}")
     # ② 玻璃只做点缀：内容（照片瓦片）不再套玻璃光影，只留低透的面 + 发丝线
     seen: dict = {}
     real_paint = mw.paint_glass
@@ -449,6 +519,161 @@ def main() -> int:
     foot = band_lum(canvas.height() - 6)
     check("顶栏受光带：上亮下暗（渐变光影）", top > below, f"{top:.1f} vs {below:.1f}")
     check("渐变光影：顶亮底深（一档亮、一档深）", top > foot, f"{top:.1f} vs {foot:.1f}")
+
+    # ⑥ 凹槽环玻璃：环亮、顶暗底亮 —— 「凹」是光说出来的，不是描边描出来的
+    well = _well_probe()
+    top_edge, bottom_edge = _peak_alpha(well, QRect(24, 0, 12, 2)), _peak_alpha(well, QRect(24, 58, 12, 2))
+    check("凹槽环：下缘比上缘亮（参考图里下缘是反光）", bottom_edge > top_edge,
+          f"{bottom_edge} vs {top_edge}")
+    check("凹槽底：上深下浅（凹进去）",
+          well.pixelColor(30, 8).lightness() < well.pixelColor(30, 52).lightness(),
+          f"{well.pixelColor(30, 8).lightness()} vs {well.pixelColor(30, 52).lightness()}")
+    blue_tinted = _well_probe(tint=QColor(styles.ACCENT)).pixelColor(30, 30).blue()
+    blue_plain = _well_probe(tint=None).pixelColor(30, 30).blue()
+    check("凹槽底可着色（发送键的强调色从这里上）", blue_tinted > blue_plain + 60,
+          f"{blue_tinted} vs {blue_plain}")
+    check("槽底档位可调（fill 越大越实）",
+          _well_probe(fill=styles.CONTROL_GLASS_PRESSED).pixelColor(30, 30).alpha()
+          < _well_probe(fill=styles.SEND_WELL).pixelColor(30, 30).alpha())
+    # ⑦ 移动：拖动期间不降级材质 —— 亚克力一路都在，桌面才会在玻璃底下跟着走。
+    #    原来一拖就切成不透明薄膜，「背景跟着动」这件事在属性上直接就没了。
+    saved_mode = window._material._mode
+    window._material._mode = ui_glass.MODE_ACRYLIC
+    origin = window.pos()
+    window._begin_move(QPoint(300, 200))
+    check("拖动期间不降级材质（亚克力一路都在）",
+          window._material._suspended is False, str(window._material._suspended))
+    window._apply_move(QPoint(430, 200))
+    check("拖动跟手（位移 = 鼠标位移）", window.pos() == origin + QPoint(130, 0),
+          f"{origin} -> {window.pos()}")
+    window._end_move()
+    check("松手结束拖动会话", window._move_session is None)
+    window._material._mode = saved_mode
+    window._material._suspended = False
+
+    print("\n[17] 让玻璃「活着」：指针光 / 焦散 / 环境光 / 各向异性")
+    # ① 指针光：一块玻璃的光影由**光位**决定，光一挪整套光影都得跟着挪。
+    #    只开镜面热点（关掉光泽 / 边缘光 / 色差 / 焦散），才量得到热点本身。
+    only_spec = {"gloss": False, "rim": False, "aberration": False, "caustic": False}
+    corner_tl, corner_br = QRect(0, 0, 28, 14), QRect(44, 22, 36, 18)
+    # 光位全部显式给：这几条量的是**光位 → 光影**的对应关系，不该受全局指针光影响。
+    rest_spec = _glass_probe(light=QPointF(*styles.GLASS_LIGHT_REST), **only_spec)
+    far_spec = _glass_probe(light=QPointF(0.9, 0.9), **only_spec)
+    check("光位可跟（同一块玻璃，光源换了位置就是另一套光）",
+          _pixel_diff(rest_spec, far_spec) > 0)
+    check("镜面热点朝着光源（静息在左上，指针到右下就跟过去）",
+          _peak_alpha(rest_spec, corner_tl) > _peak_alpha(rest_spec, corner_br)
+          and _peak_alpha(far_spec, corner_br) > _peak_alpha(far_spec, corner_tl),
+          f"{_peak_alpha(rest_spec, corner_tl)}/{_peak_alpha(rest_spec, corner_br)} -> "
+          f"{_peak_alpha(far_spec, corner_tl)}/{_peak_alpha(far_spec, corner_br)}")
+    #    受光边跟着转：光从下面来，下缘就该比上缘亮（整圈亮边的方向是活的）
+    only_rim = {"gloss": False, "specular": False, "aberration": False, "caustic": False}
+    top_band, bottom_band = QRect(30, 0, 20, 2), QRect(30, 38, 20, 2)
+    rest_rim = _glass_probe(light=QPointF(*styles.GLASS_LIGHT_REST), **only_rim)
+    down_rim = _glass_probe(light=QPointF(0.0, 1.0), **only_rim)
+    check("受光边跟着光源转（光从下面来 ⇒ 下缘反而更亮）",
+          _peak_alpha(rest_rim, top_band) > _peak_alpha(rest_rim, bottom_band)
+          and _peak_alpha(down_rim, bottom_band) > _peak_alpha(down_rim, top_band),
+          f"{_peak_alpha(down_rim, top_band)} vs {_peak_alpha(down_rim, bottom_band)}")
+    # ② 边缘焦散：光穿过玻璃，在**背光侧**聚成一道亮弧（关掉就没有）
+    only_caustic = {"gloss": False, "specular": False, "aberration": False, "rim": False}
+    arc = _glass_probe(light=QPointF(0.0, -1.0), caustic=True, **only_caustic)
+    check("焦散确实画了（这是「光穿过玻璃」的那道弧）",
+          _pixel_diff(arc, _glass_probe(light=QPointF(0.0, -1.0), caustic=False, **only_caustic)) > 0)
+    check("焦散聚在背光侧（光从上面来 ⇒ 亮弧在下缘）",
+          _peak_alpha(arc, QRect(30, 35, 20, 5)) > _peak_alpha(arc, QRect(30, 0, 20, 5)),
+          f"{_peak_alpha(arc, QRect(30, 0, 20, 5))} vs {_peak_alpha(arc, QRect(30, 35, 20, 5))}")
+    # ③ 指针光不是瞬移：刚挪过去还留在原处，随后一档一档追上（那点延迟就是黏度）
+    field = ui_liquid.pointer_light()
+    field._current = QPointF(*styles.GLASS_LIGHT_REST)
+    field._target = QPointF(*styles.GLASS_LIGHT_REST)
+    field.aim_at(window, QPointF(window.mapToGlobal(QPoint(window.width() - 2, window.height() - 2))))
+    check("指针光不瞬移（刚挪过去还留在静息光位）",
+          abs(field.direction.x() - styles.GLASS_LIGHT_REST[0]) < 0.05,
+          f"{field.direction.x():.3f}")
+    QTest.qWait(700)
+    check("指针光最终跟上（热点落到指针那一侧）",
+          field.direction.x() > 0.5 and field.direction.y() > 0.5, str(field.direction))
+    # ④ 内容环境光：只借色调（保色相 / 降饱和 / 夹明度），不能变成彩色塑料
+    def borrow(fill: str) -> QColor:
+        pixmap = QPixmap(8, 8)
+        pixmap.fill(QColor(fill))
+        return mw._average_color(pixmap)
+
+    source = QColor("#2E86AB")
+    got = borrow("#2E86AB")
+    check("借色：保色相、降饱和（降不下去玻璃就成了彩色塑料）",
+          abs(got.getHsvF()[0] - source.getHsvF()[0]) < 0.02
+          and got.getHsvF()[1] <= source.getHsvF()[1] * styles.AMBIENT_MIX + 0.02,
+          f"{got.getHsvF()}")
+    check("借色：明度夹在 FLOOR..CEIL（雪景洗不白、夜景压不暗）",
+          borrow("#FFFFFF").valueF() <= styles.AMBIENT_VALUE_CEIL + 1e-3
+          and borrow("#000000").valueF() >= styles.AMBIENT_VALUE_FLOOR - 1e-3,
+          f"{borrow('#FFFFFF').valueF():.2f} / {borrow('#000000').valueF():.2f}")
+    # 环境光压在薄面**之下**，但仍要按「最暗底」把 AA 守住（染色不许拿可读性去换）
+    darkest_borrow = QColor.fromHsvF(0.0, styles.AMBIENT_MIX, styles.AMBIENT_VALUE_FLOOR)
+    with_ambient = _flatten(
+        "#%02X%02X%02X" % (darkest_borrow.red(), darkest_borrow.green(), darkest_borrow.blue()),
+        styles.AMBIENT_ALPHA,
+        floor_bg,
+    )
+    ambient_worst = _flatten(
+        styles.RECESS_WASH,
+        styles.BOTTOM_SHADE / 255.0,
+        _flatten(styles.CARD, styles.SIDEBAR_FACE, with_ambient),
+    )
+    ratio = _contrast(styles.TEXT_SECONDARY, ambient_worst)
+    check(f"叠上内容环境光后，最差底仍 {ratio:.2f}:1 ≥ 4.5", ratio >= 4.5, ambient_worst)
+    item = {"file_path": paths[0], "file_name": "borrow.png"}
+    window._settle_ambient(item)
+    QTest.qWait(styles.AMBIENT_SETTLE_MS + 200)
+    check("新图进来 ⇒ 玻璃真的被染上（环境光淡入到满）",
+          window._ambient_color is not None and window._ambient_level > 0.99,
+          f"{window._ambient_level:.2f}")
+    window._received_items.clear()   # 内容清空（不是只剩一份列表，是真的没有了）
+    window._render_thumbs()
+    QTest.qWait(styles.AMBIENT_SETTLE_MS + 200)
+    check("内容清空 ⇒ 染色退干净（不留一块没来由的色）",
+          window._ambient_color is None and window._ambient_level < 0.01,
+          f"{window._ambient_level:.2f}")
+    # ⑤ 按下：纵向压、横向鼓 —— 各向异性才是「一滴液体」，等比缩放只是图标在缩
+    squash = mw.PressSpring(window)
+    squash.press()
+    QTest.qWait(260)
+    check("按下：纵向压 + 横向鼓（各向异性）",
+          styles.GLASS_SQUASH > 0 and squash.sy < 1.0 and squash.sx > 1.0,
+          f"{squash.sx:.4f} x {squash.sy:.4f}")
+    squash.release()
+    QTest.qWait(260)
+    check("松手回到各向同性（1 : 1）",
+          abs(squash.sx - 1.0) < 1e-6 and abs(squash.sy - 1.0) < 1e-6,
+          f"{squash.sx:.4f} x {squash.sy:.4f}")
+    # ⑥ 材质：首选**纯模糊**。亚克力（ACCENT_ENABLE_ACRYLICBLURBEHIND）在 Windows 11 上
+    #    会额外叠一层系统乳白，不跟着我们的令牌走 —— 桌面再透也上不来，就是「廉价」的来源。
+    material = ui_glass.GlassMaterial()
+    wanted: list = []
+    material._apply_accent = lambda state, tint: (wanted.append(state), True)[1]
+    material._dwmapi = None
+    material.attach(1, styles.GLASS_TINT_ABGR)
+    check("材质首选纯模糊（系统不掺色，着色 / 加厚 / 高光全由我们自己画）",
+          wanted == [ui_glass.ACCENT_ENABLE_BLURBEHIND], str(wanted))
+    # ⑦ 大面板不铺面：整窗与图片口任何一层都不许有光泽带 / 镜面热点 ——
+    #    一块几万像素的板，柔光铺开就是一片奶白，那正是「糊」。
+    faces: list = []
+    glows: list = []
+    real_paint, real_glow = mw.paint_glass, mw.paint_edge_glow
+    mw.paint_glass = lambda p, r, rad, **kw: faces.append(kw)
+    mw.paint_edge_glow = lambda p, r, rad, **kw: glows.append(kw)
+    window.paintEvent(None)
+    window._image_port.paintEvent(None)
+    mw.paint_glass, mw.paint_edge_glow = real_paint, real_glow
+    check("整窗 + 图片口都不铺光泽 / 镜面热点（大面板只沿边给光）",
+          bool(faces) and all(kw.get("gloss") is False and kw.get("specular") is False for kw in faces),
+          str(faces))
+    check("受光边那圈薄光真的画在窗口上（跟着全局光位）",
+          len(glows) == 1 and glows[0].get("light") is None, str(glows))
+    check("弹层里的移动也算本窗口的（Qt.Popup 是顶层窗口，isAncestorOf 认不出来）",
+          window._owns(window._menu) and window._owns(window._send_btn) and not window._owns(app))
 
     check("自测没有写用户真实配置", _snapshot(QSettings(*real_scope)) == real_before)
     QSettings(mw.SETTINGS_ORG, mw.SETTINGS_APP).clear()

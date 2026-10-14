@@ -16,11 +16,31 @@
 弹出菜单本来就带 Qt 的 ``QGraphicsDropShadowEffect``，够用。
 
 折射用「边缘亮度梯度」近似：边缘越亮，越像被掰弯的高光。
+
+在这套光影结构之上，还有四件让玻璃「活着」的事（都收在 styles 令牌里）：
+- **指针光**：整块界面只有**一个光源**（``LightField``）。指针在哪，光就从哪来 ——
+  镜面热点朝光源偏移、受光边跟着转。指针每动一下光只跟一小步，所以是「跟过来」的，
+  不是瞬移。这一点延迟正是「有生命的液体」和「一张贴纸」的区别。
+- **边缘焦散**：光穿过玻璃，在**背光侧**聚成一道细亮弧（真正的玻璃边缘就有这圈）。
+  它跟着指针光转，光一挪，亮弧就绕到另一边去。
+- **内容环境光**：收到的照片把自己的颜色借给整窗玻璃一点（见 main_window 的 AMBIENT_*）。
+- **各向异性压扁**：按下时纵向压、横向鼓 —— 像一滴液体被指尖按下去（``PressSpring``）。
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QPointF, QRectF, QVariantAnimation, Qt
+import math
+
+from PySide6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPointF,
+    QRectF,
+    QTimer,
+    QVariantAnimation,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QLinearGradient,
@@ -33,11 +53,30 @@ from PySide6.QtWidgets import QFrame, QWidget
 
 from .styles import (
     GLASS_ABERRATION,
+    GLASS_CAUSTIC,
+    GLASS_CAUSTIC_INSET,
+    GLASS_EDGE_GLOW,
+    GLASS_EDGE_GLOW_WIDTH,
     GLASS_GLOSS,
     GLASS_INNER_SHADOW,
+    GLASS_LIGHT_EASE,
+    GLASS_LIGHT_REST,
+    GLASS_LIGHT_SHIFT,
     GLASS_RIM_BOTTOM,
     GLASS_RIM_TOP,
+    GLASS_SQUASH,
     GLASS_SPECULAR,
+    LIGHT_TICK_MS,
+    RECESS_WASH,
+    RING_BOTTOM_LIGHT,
+    RING_EDGE_BOTTOM,
+    RING_EDGE_TOP,
+    RING_FILL_FLOOR,
+    RING_FILL_TOP,
+    RING_INSET,
+    RING_LIGHT_TOP,
+    RING_SHADOW,
+    RING_TOP_SHADE,
     animations_enabled,
 )
 
@@ -54,13 +93,106 @@ def glass_path(rect: QRectF, radius: float) -> QPainterPath:
     return path
 
 
-def scaled_rect(rect: QRectF, scale: float) -> QRectF:
-    """以中心为原点缩放矩形（按下回弹用）。"""
-    if scale == 1.0:
+def squashed_rect(rect: QRectF, sx: float, sy: float) -> QRectF:
+    """以中心为原点**分轴**缩放矩形（按下时纵向压、横向鼓）。"""
+    if sx == 1.0 and sy == 1.0:
         return rect
-    dx = rect.width() * (1.0 - scale) / 2.0
-    dy = rect.height() * (1.0 - scale) / 2.0
+    dx = rect.width() * (1.0 - sx) / 2.0
+    dy = rect.height() * (1.0 - sy) / 2.0
     return rect.adjusted(dx, dy, -dx, -dy)
+
+
+def _clamp_unit(value: float) -> float:
+    return max(-1.0, min(1.0, value))
+
+
+class LightField(QObject):
+    """全局指针光：**一整个界面只有一个光源**。
+
+    光位是归一化方向（-1..1，相对所在窗口的中心）：指针在哪，光就从哪来。
+    指针每动一下只跟 ``GLASS_LIGHT_EASE`` 一小步（30fps 心跳），所以光「跟过来」
+    而不是瞬移 —— 那一点点延迟就是玻璃里液体的黏度。
+    """
+
+    moved = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._current = QPointF(*GLASS_LIGHT_REST)
+        self._target = QPointF(*GLASS_LIGHT_REST)
+        self._timer = QTimer(self)
+        self._timer.setInterval(LIGHT_TICK_MS)
+        self._timer.timeout.connect(self._step)
+
+    @property
+    def direction(self) -> QPointF:
+        return QPointF(self._current)
+
+    def aim_at(self, host: QWidget, global_pos: QPointF) -> None:
+        """把光源挪到指针处（相对 host 窗口中心归一化）。"""
+        rect = host.rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        local = host.mapFromGlobal(global_pos.toPoint())
+        self._target = QPointF(
+            _clamp_unit((local.x() - rect.width() / 2.0) / (rect.width() / 2.0)),
+            _clamp_unit((local.y() - rect.height() / 2.0) / (rect.height() / 2.0)),
+        )
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _step(self) -> None:
+        delta = self._target - self._current
+        if abs(delta.x()) < 0.005 and abs(delta.y()) < 0.005:
+            self._current = QPointF(self._target)
+            self._timer.stop()
+        else:
+            self._current += delta * GLASS_LIGHT_EASE
+        self.moved.emit()
+
+
+_LIGHT_FIELD: LightField | None = None
+
+
+def pointer_light() -> LightField:
+    """取全局光场（首次调用时创建）。"""
+    global _LIGHT_FIELD
+    if _LIGHT_FIELD is None:
+        _LIGHT_FIELD = LightField()
+    return _LIGHT_FIELD
+
+
+def follow_light(widget: QWidget) -> None:
+    """让一块玻璃跟着全局指针光重绘：光挪一步，它就亮一次。
+
+    PySide6 在接收者（QObject）销毁时会自动断掉连接，所以缩略图上那个删了又建的
+    删除键不会攒下连接，也不会被信号吊住不释放（实测见开发日志）。
+    """
+    pointer_light().moved.connect(widget.update)
+
+
+def light_direction() -> QPointF:
+    """当前光位；光场还没建起来就是静息光位（左上）。"""
+    return QPointF(*GLASS_LIGHT_REST) if _LIGHT_FIELD is None else _LIGHT_FIELD.direction
+
+
+def _light_unit(light: QPointF | None) -> tuple[float, float]:
+    """光源方向的单位向量；零向量回退到静息光位。"""
+    direction = light_direction() if light is None else light
+    dx, dy = float(direction.x()), float(direction.y())
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        dx, dy = GLASS_LIGHT_REST
+        length = math.hypot(dx, dy)
+    return dx / length, dy / length
+
+
+def _light_axis(rect: QRectF, light: QPointF | None) -> tuple[QPointF, QPointF]:
+    """沿光轴取两个端点：光源侧（亮）与背光侧（暗）。"""
+    dx, dy = _light_unit(light)
+    center = rect.center()
+    span = QPointF(dx * rect.width() / 2.0, dy * rect.height() / 2.0)
+    return center + span, center - span
 
 
 def paint_glass(
@@ -76,14 +208,20 @@ def paint_glass(
     specular: bool = True,
     aberration: bool = True,
     rim: bool = True,
+    light: QPointF | None = None,
+    caustic: bool | None = None,
 ) -> None:
     """把一块液态玻璃画进 ``rect``。
 
     ``tint`` / ``alpha`` 是玻璃的底色（``None`` = 全透明，只留光影）；``lit`` 缩放所有
     高光强度（悬停调高、按下调低）；``pressed`` 追加内阴影，玻璃看上去被压进去。
-    图层顺序：底色 → 光泽 → 镜面热点 → 内阴影 → 边缘色差 → 镜面边缘光。
+    ``light`` 是光源方向（``None`` = 用全局指针光）：光泽、镜面热点、边缘光与焦散
+    全部朝它对齐 —— 所有玻璃因此共用同一个光源。``caustic`` 缺省跟随 ``rim``。
+    图层顺序：底色 → 光泽 → 镜面热点 → 内阴影 → 边缘色差 → 焦散 → 镜面边缘光。
     """
     lit = max(0.0, lit)
+    if caustic is None:
+        caustic = rim
     path = glass_path(rect, radius)
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -103,21 +241,21 @@ def paint_glass(
 
     painter.setClipPath(path)
 
-    # 2) 顶部光泽
+    # 2) 表面光泽：顺着光轴，从光源那侧铺开、到中线前就淡没
     if gloss and GLASS_GLOSS > 0:
-        band = QRectF(rect.left(), rect.top(), rect.width(), rect.height() * 0.55)
-        sheen = QLinearGradient(band.topLeft(), band.bottomLeft())
+        light_side, shade_side = _light_axis(rect, light)
+        sheen = QLinearGradient(light_side, shade_side)
         sheen.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_GLOSS * lit)))
+        sheen.setColorAt(0.55, QColor(255, 255, 255, 0))
         sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(sheen)
-        painter.drawRect(band)
+        painter.drawRect(rect)
 
-    # 3) 镜面热点：光源在左上
+    # 3) 镜面热点：跟着光源走（指针在哪，亮点就在哪一侧）
     if specular and GLASS_SPECULAR > 0:
-        center = QPointF(
-            rect.left() + rect.width() * 0.24, rect.top() + rect.height() * 0.06
-        )
+        light_side, _ = _light_axis(rect, light)
+        center = light_side + (rect.center() - light_side) * GLASS_LIGHT_SHIFT
         spread = max(rect.width(), rect.height()) * 0.55
         hot = QRadialGradient(center, spread)
         hot.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_SPECULAR * lit)))
@@ -152,11 +290,29 @@ def paint_glass(
                 glass_path(rect.adjusted(1.0, 1.0 + dy, -1.0, -1.0 + dy), radius - 1.0)
             )
 
-    # 6) 镜面边缘光：对角渐变 —— 左上受光、右下背光
+    # 6) 边缘焦散：光穿过玻璃，在**背光侧**聚成一道细亮弧
+    if caustic and GLASS_CAUSTIC > 0:
+        light_side, shade_side = _light_axis(rect, light)
+        arc = QLinearGradient(light_side, shade_side)
+        arc.setColorAt(0.0, QColor(255, 255, 255, 0))
+        arc.setColorAt(0.45, QColor(255, 255, 255, 0))
+        arc.setColorAt(1.0, QColor(255, 255, 255, round(255 * GLASS_CAUSTIC * lit)))
+        pen = QPen()
+        pen.setBrush(arc)
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        inset = GLASS_CAUSTIC_INSET
+        painter.drawPath(
+            glass_path(rect.adjusted(inset, inset, -inset, -inset), max(0.0, radius - inset))
+        )
+
+    # 7) 镜面边缘光：沿光轴渐变 —— 光源那侧受光、另一侧背光
     if rim:
-        edge = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        light_side, shade_side = _light_axis(rect, light)
+        edge = QLinearGradient(light_side, shade_side)
         edge.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_RIM_TOP * lit)))
-        edge.setColorAt(0.45, QColor(255, 255, 255, round(255 * GLASS_RIM_TOP * 0.35 * lit)))
+        edge.setColorAt(0.5, QColor(255, 255, 255, round(255 * GLASS_RIM_TOP * 0.35 * lit)))
         edge.setColorAt(1.0, QColor(255, 255, 255, round(255 * GLASS_RIM_BOTTOM * lit)))
         pen = QPen()
         pen.setBrush(edge)
@@ -164,6 +320,126 @@ def paint_glass(
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
+
+    painter.restore()
+
+
+def paint_edge_glow(
+    painter: QPainter,
+    rect: QRectF,
+    radius: float,
+    *,
+    light: QPointF | None = None,
+) -> None:
+    """受光边那圈内圈薄光：沿光源那侧的一条亮带，向内很快淡掉。
+
+    大面板上的取舍：铺**面**就是奶白（一块几万像素的板，任何一层柔光都会糊成一片），
+    完全不给光又变成一块死玻璃。所以只给**边** —— 而且宽度是**像素**（不是比例），
+    窗口放大时它不会跟着摊开。光跟着指针走，这条亮带就绕着窗口转。
+    """
+    if GLASS_EDGE_GLOW <= 0:
+        return
+    dx, dy = _light_unit(light)
+    light_side = rect.center() + QPointF(dx * rect.width() / 2.0, dy * rect.height() / 2.0)
+    inner = light_side - QPointF(dx * GLASS_EDGE_GLOW_WIDTH, dy * GLASS_EDGE_GLOW_WIDTH)
+    band = QLinearGradient(light_side, inner)
+    band.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_EDGE_GLOW)))
+    band.setColorAt(0.45, QColor(255, 255, 255, round(255 * GLASS_EDGE_GLOW * 0.35)))
+    band.setColorAt(1.0, QColor(255, 255, 255, 0))
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setClipPath(glass_path(rect, radius))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(band)
+    painter.drawRect(rect)
+    painter.restore()
+
+
+def paint_well_glass(
+    painter: QPainter,
+    rect: QRectF,
+    radius: float,
+    *,
+    fill: float,
+    lit: float = 1.0,
+    tint: QColor | None = None,
+) -> None:
+    """凹槽环玻璃（参考图里那枚圆钮 / 胶囊）：半透 + 细描边 + 弱阴影。
+
+    和 ``paint_glass`` 的分工很明确：这里**不铺浅色面**，只画「一个凹槽」——
+    半透的槽底（上深下浅 = 凹）+ 顶内阴影 + 底内受光 + 一圈发丝亮环 + 环外一条弱落影。
+    因为不铺面，背后的亚克力模糊能整片透上来，玻璃才像在呼吸；立体感全靠光。
+
+    ``tint`` 是槽底座色（缺省 = 深色洗）：发送键传强调色，槽就是「强调色凹槽」；
+    底色越实、其上字形对比越低，所以 ``fill`` 与 ``tint`` 要跟对比度一起调。
+    图层顺序：槽底 → 顶内阴影 → 底内受光 → 弱落影 → 发丝环（最后画，环才完整）。
+    """
+    lit = max(0.0, lit)
+    well_rect = rect.adjusted(RING_INSET, RING_INSET, -RING_INSET, -RING_INSET)
+    path = glass_path(well_rect, max(0.0, radius - RING_INSET))
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    # 1) 槽底：半透的底座色，上深下浅 —— 上深下浅才像「凹进去」
+    base = QColor(RECESS_WASH) if tint is None else QColor(tint)
+    top = QColor(base)
+    top.setAlphaF(min(1.0, fill * RING_FILL_TOP))
+    bottom = QColor(base)
+    bottom.setAlphaF(max(0.0, fill * RING_FILL_FLOOR))
+    well = QLinearGradient(well_rect.topLeft(), well_rect.bottomLeft())
+    well.setColorAt(0.0, top)
+    well.setColorAt(1.0, bottom)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(well)
+    painter.drawPath(path)
+
+    painter.setClipPath(path)
+
+    # 2) 顶内阴影：短带渐隐，把「凹」再压一层
+    if RING_TOP_SHADE > 0:
+        band = QRectF(well_rect.left(), well_rect.top(), well_rect.width(), well_rect.height() * 0.55)
+        shade = QLinearGradient(band.topLeft(), band.bottomLeft())
+        shade.setColorAt(0.0, QColor(*SHADOW_INK, round(255 * RING_TOP_SHADE * lit)))
+        shade.setColorAt(1.0, QColor(*SHADOW_INK, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(shade)
+        painter.drawRect(band)
+
+    # 3) 底内受光：贴底那圈收到的反光（凹面才不是一块平贴纸）
+    if RING_BOTTOM_LIGHT > 0:
+        band = QRectF(
+            well_rect.left(),
+            well_rect.top() + well_rect.height() * RING_LIGHT_TOP,
+            well_rect.width(),
+            well_rect.height() * (1.0 - RING_LIGHT_TOP),
+        )
+        glow = QLinearGradient(band.topLeft(), band.bottomLeft())
+        glow.setColorAt(0.0, QColor(255, 255, 255, 0))
+        glow.setColorAt(1.0, QColor(255, 255, 255, round(255 * RING_BOTTOM_LIGHT * lit)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(glow)
+        painter.drawRect(band)
+
+    painter.setClipping(False)
+
+    # 4) 弱落影：环外偏下一条极轻的深色 —— 细描边在外，弱阴影在更外面
+    if RING_SHADOW > 0:
+        pen = QPen(QColor(*SHADOW_INK, round(255 * RING_SHADOW * lit)))
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(glass_path(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius))
+
+    # 5) 发丝环：1px，上缘暗一档、下缘最亮（参考图的下缘就是亮的 —— 那是反光）
+    edge = QLinearGradient(well_rect.topLeft(), well_rect.bottomLeft())
+    edge.setColorAt(0.0, QColor(255, 255, 255, round(255 * RING_EDGE_TOP * lit)))
+    edge.setColorAt(1.0, QColor(255, 255, 255, round(255 * RING_EDGE_BOTTOM * lit)))
+    pen = QPen()
+    pen.setBrush(edge)
+    pen.setWidthF(1.0)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
 
     painter.restore()
 
@@ -210,15 +486,17 @@ class GlassSurface(QFrame):
 
 
 class PressSpring:
-    """按下回弹：按下缩一点，松手用 OutBack 弹回（对应参考实现的 elasticity）。
+    """按下回弹：按下纵向压、横向鼓，松手用 OutBack 弹回（参考实现的 elasticity）。
 
+    **各向异性**是「液体」的关键：一按就等比缩小只是个图标在缩放，纵向压扁 + 横向
+    鼓起才像一滴液体被指尖按下去（``GLASS_SQUASH`` 控制横鼓有多少）。
     尊重系统「减少动态效果」：动画关闭时直接落终态。
     """
 
     def __init__(self, widget: QWidget, depth: float = 0.035) -> None:
         self._widget = widget
         self._depth = depth
-        self._scale = 1.0
+        self._progress = 0.0        # 0 = 静息，1 = 按到底
         self._animation = QVariantAnimation(widget)
         self._animation.setDuration(200 if animations_enabled() else 0)
         self._animation.setEasingCurve(QEasingCurve.Type.OutBack)
@@ -226,22 +504,33 @@ class PressSpring:
 
     @property
     def scale(self) -> float:
-        return self._scale
+        """纵向缩放（沿用旧名：按下「缩一点」的那一档）。"""
+        return self.sy
+
+    @property
+    def sx(self) -> float:
+        """横向缩放：按下时反而**鼓**出来一点。"""
+        return 1.0 + self._depth * GLASS_SQUASH * self._progress
+
+    @property
+    def sy(self) -> float:
+        """纵向缩放：按下时压扁。"""
+        return 1.0 - self._depth * self._progress
 
     def press(self) -> None:
-        self._run(1.0 - self._depth)
+        self._run(1.0)
 
     def release(self) -> None:
-        self._run(1.0)
+        self._run(0.0)
 
     def _run(self, target: float) -> None:
         self._animation.stop()
-        self._animation.setStartValue(self._scale)
+        self._animation.setStartValue(self._progress)
         self._animation.setEndValue(target)
         self._animation.start()
         if self._animation.duration() == 0:
             self._on_value(target)
 
     def _on_value(self, value) -> None:
-        self._scale = float(value)
+        self._progress = float(value)
         self._widget.update()

@@ -245,6 +245,26 @@ def image(painter: QPainter, rect: QRectF, color) -> None:
     painter.drawPath(hills)
 
 
+def arrow_up(painter: QPainter, rect: QRectF, color) -> None:
+    """发送：细描边的向上箭头（圆头圆角）—— 对应参考图里那枚圆钮的箭头。
+
+    杆 + 人字形箭头分开画，接缝靠圆头盖住；线宽用比例，所以 14px 与 30px 都成立。
+    描边比同族图标细一档（0.105）：参考图里的箭头是「细而挺」的，粗了就变成实心三角。
+    """
+    painter.setPen(_stroke_pen(rect, color, 0.105))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    cx = rect.center().x()
+    top = rect.top() + rect.height() * 0.24
+    bottom = rect.bottom() - rect.height() * 0.24
+    head = rect.width() * 0.27
+    painter.drawLine(QPointF(cx, bottom), QPointF(cx, top))
+    path = QPainterPath()
+    path.moveTo(cx - head, top + head * 0.95)
+    path.lineTo(cx, top)
+    path.lineTo(cx + head, top + head * 0.95)
+    painter.drawPath(path)
+
+
 _GLYPHS = {
     "airdrop": airdrop,
     "phone": phone,
@@ -258,6 +278,7 @@ _GLYPHS = {
     "close": close,
     "image": image,
     "check": check,
+    "arrow_up": arrow_up,
 }
 
 

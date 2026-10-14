@@ -22,6 +22,7 @@ from PySide6.QtCore import (
     QEvent,
     QMimeData,
     QPoint,
+    QPointF,
     QPropertyAnimation,
     QRect,
     QRectF,
@@ -30,6 +31,7 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     QUrl,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -42,6 +44,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QRadialGradient,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -67,19 +70,38 @@ from PySide6.QtWidgets import (
 
 from .glass import MODE_SOLID, GlassMaterial
 from .glyphs import paint_glyph
-from .liquid import GlassSurface, PressSpring, glass_path, paint_glass, scaled_rect
+from .liquid import (
+    GlassSurface,
+    PressSpring,
+    follow_light,
+    glass_path,
+    paint_edge_glow,
+    paint_glass,
+    paint_well_glass,
+    pointer_light,
+    squashed_rect,
+)
 from .styles import (
     ACCENT,
-    ACCENT_GLASS_HOVER,
-    ACCENT_GLASS_PRESSED,
-    ACCENT_GLASS_REST,
     ACCENT_HOVER,
     ACCENT_ICON,
     ACCENT_PRESSED,
+    AMBIENT_ALPHA,
+    AMBIENT_DIP,
+    AMBIENT_MIX,
+    AMBIENT_SETTLE_MS,
+    AMBIENT_SPREAD,
+    AMBIENT_VALUE_CEIL,
+    AMBIENT_VALUE_FLOOR,
     BG,
     BOTTOM_SHADE,
+    CARD,
     CHIP_ALPHA,
+    CONTROL_GLASS,
+    CONTROL_GLASS_HOVER,
+    CONTROL_GLASS_PRESSED,
     DEFAULT_DEVICE_GLYPH,
+    FACE_FALLOFF,
     GLASS_LIT_HOVER,
     GLASS_LIT_LENS,
     GLASS_LIT_MENU,
@@ -88,8 +110,6 @@ from .styles import (
     GLASS_LIT_REST,
     GLASS_LIT_WINDOW,
     GLASS_SURFACE,
-    GLASS_SURFACE_HOVER,
-    GLASS_SURFACE_PRESSED,
     GLASS_TINT_ABGR,
     HAIRLINE_ALPHA,
     MENU_ALPHA,
@@ -97,19 +117,31 @@ from .styles import (
     MENU_ROW_HOVER,
     MENU_ROW_PRESSED,
     OFFLINE,
+    POOL_ALPHA,
+    POOL_CORE,
+    POOL_MID,
+    POOL_MID_ALPHA,
+    POOL_RX,
+    POOL_RY,
     QSS,
     RADIUS_CARD,
     RADIUS_CONTROL,
     RADIUS_MENU,
     RADIUS_WINDOW,
-    RAIL_ALPHA,
     RECESS_WASH,
+    ROW_HOVER_FACE,
+    SEND_WELL,
+    SEND_WELL_HOVER,
+    SEND_WELL_PRESSED,
+    SIDEBAR_FACE,
     SPACE_1,
     SPACE_2,
     SPACE_3,
     SPACE_5,
+    STATUSBAR_FACE,
     TEXT,
     TEXT_SECONDARY,
+    TOPBAR_FACE,
     TOPBAR_SHEEN,
     WELL_ALPHA,
     animations_enabled,
@@ -147,7 +179,9 @@ SIDEBAR_W = 158
 TOPBAR_H = 44
 STATUSBAR_H = 36
 ICON_BTN = 26
-SEND_BTN_W, SEND_BTN_H = 76, 30
+SEND_BTN = 34                  # 发送：圆钮直径（只有箭头图标，不再有文字标签）
+SEND_GLYPH = 0.56              # 发送：箭头图形占圆钮的比例（照参考图量）
+AMBIENT_PROBE = 24             # 取内容环境光时缩到多大再平均（够稳，也不解码一张大图）
 
 # 隔空投送模块卡片（左侧功能键）
 CARD_W = SIDEBAR_W - 2 * SPACE_3
@@ -229,6 +263,38 @@ def _load_thumb(path: str, w: int, h: int) -> QPixmap | None:
     return _load_thumb_via_pillow(path, w, h)
 
 
+def _average_color(pixmap: QPixmap | None) -> QColor | None:
+    """一张图借给玻璃的那点颜色：**保色相、降饱和、夹明度**（见 AMBIENT_* 令牌）。
+
+    直接拿平均色去染玻璃是错的：一张雪景会把整窗洗白，一张夜景会把字压到 AA 以下。
+    所以只借色调（饱和度乘 AMBIENT_MIX），明度夹在 FLOOR..CEIL 之间 —— 玻璃能看出
+    「刚收到的那张图是暖的还是冷的」，但读起来还是玻璃，不是彩色塑料。
+    """
+    if pixmap is None or pixmap.isNull():
+        return None
+    small = pixmap.toImage().scaled(
+        8, 8, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+    )
+    red = green = blue = count = 0
+    for y in range(small.height()):
+        for x in range(small.width()):
+            pixel = small.pixelColor(x, y)
+            if pixel.alpha() == 0:
+                continue
+            red += pixel.red()
+            green += pixel.green()
+            blue += pixel.blue()
+            count += 1
+    if not count:
+        return None
+    hue, saturation, value, _ = QColor(red // count, green // count, blue // count).getHsvF()
+    return QColor.fromHsvF(
+        hue if hue >= 0.0 else 0.0,
+        saturation * AMBIENT_MIX,
+        min(max(value, AMBIENT_VALUE_FLOOR), AMBIENT_VALUE_CEIL),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 小控件：矢量图标（毛玻璃上不用 emoji —— 彩色 emoji 会显脏、基线也对不齐）
 # --------------------------------------------------------------------------- #
@@ -261,6 +327,7 @@ class _GlyphButton(QToolButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        follow_light(self)      # 光一挪，这枚玻璃就跟着重新受光
 
     def _glass_tone(self) -> str:
         """当前该画哪一片玻璃：按下比悬停更「实」（错误色按下再深一档）。"""
@@ -297,8 +364,10 @@ class _GlyphButton(QToolButton):
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = scaled_rect(
-            QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0), self._spring.scale
+        rect = squashed_rect(
+            QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0),
+            self._spring.sx,
+            self._spring.sy,
         )
         fill = tone_material(self._glass_tone())
         if fill is not None:
@@ -329,14 +398,22 @@ class _GlyphButton(QToolButton):
 
 
 class _SendButton(QPushButton):
-    """「发送」按钮：强调色液态玻璃 —— 悬停更亮、按下压进去，松手回弹。"""
+    """「发送」按钮：强调色的凹槽环玻璃圆钮 + 细描边的白色向上箭头。
 
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
+    照着参考图（129ca2…）那枚圆钮的做法：槽底比板面深一档 + 一圈发丝亮环 +
+    顶内阴影 + 底内受光。不留文字标签 —— 箭头是通用语义，画面上少一个元素，
+    主操作反而更立得住；可读性交给 tooltip 与无障碍名，不拿无障碍换干净。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setToolTip("发送到所选设备")
+        self.setAccessibleName("发送")
         self._hover = False
         self._pressed = False
         self._spring = PressSpring(self)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        follow_light(self)
 
     def enterEvent(self, e) -> None:  # noqa: N802
         self._hover = True
@@ -366,31 +443,34 @@ class _SendButton(QPushButton):
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = scaled_rect(
-            QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0), self._spring.scale
+        rect = squashed_rect(
+            QRectF(0.0, 0.0, float(self.width()), float(self.height())),
+            self._spring.sx,
+            self._spring.sy,
         )
         if self._pressed:
-            tint, alpha, lit = ACCENT_PRESSED, ACCENT_GLASS_PRESSED, GLASS_LIT_PRESSED
+            tint, fill, lit = ACCENT_PRESSED, SEND_WELL_PRESSED, GLASS_LIT_PRESSED
         elif self._hover:
-            tint, alpha, lit = ACCENT_HOVER, ACCENT_GLASS_HOVER, GLASS_LIT_HOVER
+            tint, fill, lit = ACCENT_HOVER, SEND_WELL_HOVER, GLASS_LIT_HOVER
         else:
-            tint, alpha, lit = ACCENT, ACCENT_GLASS_REST, GLASS_LIT_REST
-        paint_glass(
+            tint, fill, lit = ACCENT, SEND_WELL, GLASS_LIT_REST
+        paint_well_glass(
             p,
             rect,
-            RADIUS_CONTROL,
-            tint=QColor(tint),
-            alpha=alpha,
+            rect.width() / 2.0,
+            fill=fill,
             lit=lit,
-            pressed=self._pressed,
+            tint=QColor(tint),
         )
-        p.setPen(QColor("#FFFFFF"))
-        p.setFont(self.font())
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+        # 箭头：比例照参考图 —— 图形约占圆钮的 56%，细描边、圆头。
+        side = rect.width() * SEND_GLYPH
+        glyph = QRectF(0.0, 0.0, side, side)
+        glyph.moveCenter(rect.center())
+        paint_glyph(p, "arrow_up", glyph, QColor("#FFFFFF"))
         if self.hasFocus():
             p.setPen(QPen(QColor("#FFFFFF"), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(rect.adjusted(2, 2, -2, -2), RADIUS_CONTROL - 2, RADIUS_CONTROL - 2)
+            p.drawEllipse(rect.adjusted(2, 2, -2, -2))
         p.end()
 
 
@@ -431,7 +511,7 @@ class DeviceItemDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
         elif hovered:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(wash(CHIP_ALPHA))
+            painter.setBrush(wash(ROW_HOVER_FACE, CARD))
             painter.drawRoundedRect(rect, RADIUS_CONTROL, RADIUS_CONTROL)
 
         alias = index.data(Qt.ItemDataRole.UserRole) or index.text() or "未知设备"
@@ -587,6 +667,7 @@ class ImagePort(QFrame):
         self.setObjectName("imagePort")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAcceptDrops(True)
+        self.setToolTip("把图片拖进来可发给手机")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._columns = GRID_COLUMNS
@@ -601,12 +682,8 @@ class ImagePort(QFrame):
         main = apply_type(QLabel("手机发来的图会出现在这里", self._empty_state), "emptyTitle")
         main.setObjectName("emptyMain")
         main.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = apply_type(QLabel("拖图片进来可发给手机", self._empty_state), "emptyBody")
-        sub.setObjectName("emptySub")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev.addWidget(icon)
         ev.addWidget(main)
-        ev.addWidget(sub)
 
         # 缩略图网格（滚动）
         self._scroll = QScrollArea(self)
@@ -644,23 +721,41 @@ class ImagePort(QFrame):
         lay.addWidget(self._scroll)
 
     def paintEvent(self, _e) -> None:  # noqa: N802
-        """图片口托盘：极轻的液态玻璃凹陷面（只留底色 + 顶部光泽）。
+        """图片口：极轻的凹陷托盘 + 空态的一小片柔光。
 
         结构分区是铺满的，不套边缘光 / 色差 —— 全出血矩形上画描边就成了硬分割线，
         而设计约定「区域之间不画硬线」，靠材质轻重区分就够了。
         """
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0.0, 0.0, float(self.width()), float(self.height()))
         paint_glass(
             p,
-            QRectF(0.0, 0.0, float(self.width()), float(self.height())),
+            rect,
             0.0,
             tint=QColor(RECESS_WASH),
             alpha=WELL_ALPHA,
+            gloss=False,
             specular=False,
             aberration=False,
             rim=False,
         )
+        # 空态文字自带一小片扁柔光：图片口是整窗最透的地方，但不能为此给文字糊一块
+        # 有硬边的面 —— 用光托住它，边界看不出来，字也站得住（见 test_ui 的对比度）。
+        # 之所以是扁椭圆而不是圆：圆池会占掉大半个图片口，在 16% 的玻璃上就是一块灰斑。
+        if self._empty_state.isVisible():
+            pool = QRadialGradient(QPointF(0.0, 0.0), 1.0)
+            pool.setColorAt(0.0, QColor(255, 255, 255, round(255 * POOL_ALPHA)))
+            pool.setColorAt(POOL_CORE, QColor(255, 255, 255, round(255 * POOL_ALPHA)))
+            pool.setColorAt(POOL_MID, QColor(255, 255, 255, round(255 * POOL_ALPHA * POOL_MID_ALPHA)))
+            pool.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(pool)
+            p.save()
+            p.translate(rect.center())
+            p.scale(rect.width() * POOL_RX, rect.height() * POOL_RY)
+            p.drawEllipse(QPointF(0.0, 0.0), 1.0, 1.0)
+            p.restore()
         p.end()
 
     def resizeEvent(self, e) -> None:  # noqa: N802
@@ -739,6 +834,7 @@ class AirdropCard(QWidget):
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setToolTip("点圆钮开 / 关隔空投送；点卡片选择可接收对象")
+        follow_light(self)
 
         self._enabled = False
         self._hover = False
@@ -781,15 +877,19 @@ class AirdropCard(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
 
-        # 浅材质面：结构分区（侧栏）比它重，所以这里叠白是「更靠近手指」，不是叠浅材质。
-        # 液态玻璃：镜面边缘光 + 顶部光泽 + 左上镜面热点 + 边缘色差。
+        # 控件玻璃：卡片是「能摸的东西」，走半透那一档（比内容面透），玻璃才有呼吸感；
+        # 悬停更实、按下更透 —— 反馈由面与光一起交代。
+        # 液态玻璃：镜面边缘光 + 顶部光泽 + 左上镜面热点。
+        # 不套边缘色差：色差是「玻璃压在桌面上」才成立的折射彩边；压在**浅色卡片**上就成了
+        # 白边旁的一道粉 / 蓝重影（实测 R/B 差 14/255，肉眼可见的脏）。卡片是浅色实体面，
+        # 立体感交给边缘光与光泽就够了。
         card_pressed = self._pressed and not self._icon_pressed
         if card_pressed:
-            alpha, lit = GLASS_SURFACE_PRESSED, GLASS_LIT_PRESSED   # 按下就变，不等抬起
+            alpha, lit = CONTROL_GLASS_PRESSED, GLASS_LIT_PRESSED   # 按下就变，不等抬起
         elif self._hover:
-            alpha, lit = GLASS_SURFACE_HOVER, GLASS_LIT_HOVER
+            alpha, lit = CONTROL_GLASS_HOVER, GLASS_LIT_HOVER
         else:
-            alpha, lit = GLASS_SURFACE, GLASS_LIT_REST
+            alpha, lit = CONTROL_GLASS, GLASS_LIT_REST
         paint_glass(
             p,
             rect,
@@ -798,6 +898,7 @@ class AirdropCard(QWidget):
             alpha=alpha,
             lit=lit,
             pressed=card_pressed,
+            aberration=False,
         )
 
         # 圆钮：开 = 强调蓝（其上白色字形 5.46:1），关 = 中性灰（4.82:1）
@@ -883,6 +984,10 @@ class AirdropCard(QWidget):
 class _MenuPanel(QFrame):
     """菜单底板：深色材质 + 顶边受光。"""
 
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        follow_light(self)
+
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -910,6 +1015,7 @@ class _ModeRow(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setMouseTracking(True)
+        follow_light(self)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(SPACE_3, 0, SPACE_3, 0)
@@ -1199,6 +1305,20 @@ class AirFloatWindow(QWidget):
         self._resize_settle.setSingleShot(True)
         self._resize_settle.timeout.connect(self._material.resume)
 
+        # -- 指针光 / 内容环境光（让玻璃「活着」）--
+        # 整块界面只有**一个光源**：指针在哪，光就从哪来。装应用级过滤器而不是靠事件
+        # 冒泡 —— 按下的控件会把鼠标移动吃掉（按钮要处理「拖出去就取消」），光会卡住。
+        self._light = pointer_light()
+        follow_light(self)
+        QApplication.instance().installEventFilter(self)
+        # 内容环境光：收到的照片把颜色借给玻璃一点，整片慢慢染过去（见 _settle_ambient）
+        self._ambient_color: QColor | None = None
+        self._ambient_level = 0.0
+        self._ambient = QVariantAnimation(self)
+        self._ambient.setDuration(AMBIENT_SETTLE_MS if animations_enabled() else 0)
+        self._ambient.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._ambient.valueChanged.connect(self._on_ambient_value)
+
         # -- 状态 --
         self._protocol = None
         self._state = {"enabled": False, "receiveMode": "everyone", "alias": ""}
@@ -1273,8 +1393,9 @@ class AirFloatWindow(QWidget):
         main.setSpacing(0)
 
         # 左窄栏
-        # 侧栏是「更重」的结构分区：液态玻璃底板，比卡片暗一档（深色洗 + 顶部光泽）
-        sidebar = GlassSurface(self._body, tint=QColor(RECESS_WASH), alpha=RAIL_ALPHA)
+        # 侧栏是结构分区：整窗是透的，栏内的字靠这层浅面托住 —— 比内容区亮一档
+        # 就是「更厚」，分区靠材质立，不靠描边。
+        sidebar = GlassSurface(self._body, tint=QColor(CARD), alpha=SIDEBAR_FACE, gloss=False)
         sidebar.setObjectName("sidebar")
         sidebar.setFixedWidth(SIDEBAR_W)
         sb = QVBoxLayout(sidebar)
@@ -1301,11 +1422,7 @@ class AirFloatWindow(QWidget):
         self._device_list.setSpacing(2)
         self._device_list.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._device_empty = apply_type(QLabel("未发现手机，请确认同一 WiFi", sidebar), "itemSub")
-        self._device_empty.setObjectName("deviceEmpty")
-        self._device_empty.setWordWrap(True)
-        self._device_empty.setVisible(False)
-        sb.addWidget(self._device_empty)
+        # 列表空着就空着：原因由状态栏那一条唯一的口径交代，侧栏不再重复同样一句话。
         sb.addWidget(self._device_list, 1)
 
         main.addWidget(sidebar)
@@ -1351,10 +1468,10 @@ class AirFloatWindow(QWidget):
         self._received_count.setVisible(False)
         st.addWidget(self._received_count)
 
-        self._send_btn = _SendButton("发送", statusbar)
+        self._send_btn = _SendButton(statusbar)
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._send_btn.setFixedSize(SEND_BTN_W, SEND_BTN_H)
+        self._send_btn.setFixedSize(SEND_BTN, SEND_BTN)
         apply_type(self._send_btn, "button")
         self._send_btn.clicked.connect(self._on_send_clicked)
         st.addWidget(self._send_btn)
@@ -1537,9 +1654,7 @@ class AirFloatWindow(QWidget):
                 if not found:
                     self._selected_fingerprint = None
 
-            empty = not self._devices
-            self._device_list.setVisible(not empty)
-            self._device_empty.setVisible(empty)
+            self._device_list.setVisible(True)
         finally:
             self._updating_devices = False
         self._update_status()
@@ -1551,6 +1666,7 @@ class AirFloatWindow(QWidget):
         if len(self._received_items) > 500:
             self._received_items = self._received_items[-500:]
         self._render_thumbs()
+        self._settle_ambient(item)
         self._update_received_count()
         self.show_toast(f"已接收：{item.get('file_name') or item.get('fileName') or '图片'}", "success")
 
@@ -1650,6 +1766,7 @@ class AirFloatWindow(QWidget):
         has = bool(self._received_items)
         self._image_port._empty_state.setVisible(not has)
         if not has:
+            self._clear_ambient()
             return
         for idx, item in enumerate(self._received_items):
             path = item.get("file_path") or item.get("filePath") or ""
@@ -1658,6 +1775,38 @@ class AirFloatWindow(QWidget):
             tw.delete_requested.connect(lambda item=item: self._remove_item(item))
             r, c = divmod(idx, self._image_port._columns)
             self._image_port._grid.addWidget(tw, r, c)
+
+    # -- 内容环境光：收到的照片把颜色借给玻璃一点（整片慢慢染过去）--
+    def _settle_ambient(self, item: dict) -> None:
+        """新图进来：先退一点再重新染上去（呼吸），而不是「啪」地换色。"""
+        path = item.get("file_path") or item.get("filePath") or ""
+        color = _average_color(_load_thumb(path, AMBIENT_PROBE, AMBIENT_PROBE))
+        if color is None:
+            return
+        self._ambient_color = color
+        self._ambient.stop()
+        self._ambient.setStartValue(self._ambient_level * AMBIENT_DIP)
+        self._ambient.setEndValue(1.0)
+        self._ambient.start()
+        if self._ambient.duration() == 0:
+            self._on_ambient_value(1.0)
+
+    def _clear_ambient(self) -> None:
+        """内容清空了：玻璃上的染色慢慢退掉，不留一块没来由的色。"""
+        if self._ambient_color is None:
+            return
+        self._ambient.stop()
+        self._ambient.setStartValue(self._ambient_level)
+        self._ambient.setEndValue(0.0)
+        self._ambient.start()
+        if self._ambient.duration() == 0:
+            self._on_ambient_value(0.0)
+
+    def _on_ambient_value(self, value) -> None:
+        self._ambient_level = float(value)
+        if self._ambient_level <= 0.001 and self._ambient.endValue() == 0.0:
+            self._ambient_color = None       # 退干净了就把颜色扔掉，避免空转重绘
+        self.update()
 
     def _remove_item(self, item: dict) -> None:
         """删除键：只把这张从列表里拿掉，不动磁盘上的文件（不替用户决定删文件）。"""
@@ -1694,7 +1843,7 @@ class AirFloatWindow(QWidget):
         elif self.selected_device():
             hint = "将发送到：" + (self.selected_device().get("alias") or "设备")
         elif self._devices:
-            hint = "点击左侧设备以选择发送目标"
+            hint = "选择左侧设备以发送"
         else:
             hint = "未发现手机，请确认同一 WiFi"
         self._status_hint.setText(hint)
@@ -1734,6 +1883,34 @@ class AirFloatWindow(QWidget):
         super().changeEvent(e)
         if e.type() == QEvent.Type.WindowStateChange:
             QTimer.singleShot(0, self._update_region)
+
+    def _owns(self, widget: QWidget) -> bool:
+        """这个控件算不算本窗口的？
+
+        不能只用 ``isAncestorOf``：弹出菜单是 ``Qt.Popup``（有父窗口，但自己是顶层窗口），
+        ``isAncestorOf`` 对它返回 False —— 指针移到菜单上时光就会卡住。所以顺着
+        ``parentWidget()`` 往上找。
+        """
+        node: QWidget | None = widget if isinstance(widget, QWidget) else None
+        while node is not None:
+            if node is self:
+                return True
+            node = node.parentWidget()
+        return False
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        """指针光：本窗口里任何一处（含子控件）的移动都点亮**同一个光源**。
+
+        不用 mouseMoveEvent 冒泡：按下的按钮会把移动事件吃掉，光会卡在按钮上不动。
+        应用级过滤器看到的每一处移动都算，光才是「整个界面共用一个光源」。
+        """
+        if (
+            event.type() == QEvent.Type.MouseMove
+            and isinstance(obj, QWidget)
+            and self._owns(obj)
+        ):
+            self._light.aim_at(self, event.globalPosition())
+        return super().eventFilter(obj, event)
 
     def showEvent(self, e) -> None:  # noqa: N802
         super().showEvent(e)
@@ -1839,9 +2016,11 @@ class AirFloatWindow(QWidget):
         不用 QWindow.startSystemMove()：无边框 + 分层（透明）窗口在 Win11 上实测它返回
         True，窗口却纹丝不动（真机与自动化各测两次，位移全是 0）。自己跟手移动最稳，
         行为也和八向缩放保持一致。
+
+        亚克力**不**在移动期间降级：窗口一路保留真实模糊，玻璃才「一路都在」；
+        缩放仍然降级 —— 边长每帧都在变，模糊跟不上的错位比降级更显眼。
         """
         self._move_session = {"origin": global_pos, "geometry": QRect(self.geometry())}
-        self._material.suspend()
 
     def _apply_move(self, global_pos: QPoint) -> None:
         """跟手移动窗口：位移量 = 当前鼠标 - 按下时鼠标。"""
@@ -1894,7 +2073,7 @@ class AirFloatWindow(QWidget):
         super().mouseReleaseEvent(e)
 
     def paintEvent(self, _e) -> None:  # noqa: N802
-        """窗口外壳：液态玻璃 + 底部内阴影 —— 用光交代厚度，不用硬描边。"""
+        """窗口外壳：透玻璃 + 文字区薄面 —— 整窗真透，有字的地方局部加厚。"""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         radius = 0 if self.isMaximized() else RADIUS_WINDOW
@@ -1912,37 +2091,92 @@ class AirFloatWindow(QWidget):
             p.setBrush(base)
             p.drawPath(path)
 
-        # 液态玻璃：镜面边缘光（对角受光）+ 左上镜面热点 + 边缘色差。
-        # 整窗不铺光泽带（gloss=False）：铺满上半屏的那层白是「奶膜」，正是糊感的来源；
-        # 光集中给顶栏（下一条受光带），内容区留干净 —— 低透的面才压得住背后的杂色。
-        paint_glass(p, rect, radius, lit=GLASS_LIT_WINDOW, gloss=False)
+        # ① 光影结构先垫底：只有那圈折射彩边（冷 / 暖各偏 1px），方向跟着**指针光**走。
+        #    整窗**不铺光泽带、也不点镜面热点**：一块几万像素的面板上，一撮热点扩散开来
+        #    就是一片铺满的奶白 —— 那正是「糊」和「廉价」的来源。大面板的玻璃签名是
+        #    **边缘**（③ 的镜面边缘光 + 焦散），里面必须能让桌面原样上得来。
+        paint_glass(p, rect, radius, lit=GLASS_LIT_WINDOW, gloss=False, specular=False, rim=False)
 
-        # 顶栏受光带：渐变光影把「顶栏 → 内容 → 状态栏」拉成一档亮、一档中、一档深，
-        # 层次由光说，不用分割线。
-        if TOPBAR_SHEEN > 0:
-            band = QRectF(0.0, 0.0, float(self.width()), float(TOPBAR_H))
-            sheen = QLinearGradient(band.topLeft(), band.bottomLeft())
-            sheen.setColorAt(0.0, QColor(255, 255, 255, round(255 * TOPBAR_SHEEN)))
-            sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(sheen)
-            p.save()
-            p.setClipPath(path)
-            p.drawRect(band)
-            p.restore()
+        # ①.5 内容环境光：收到的照片把颜色借给玻璃一点（图片口附近最浓，向外淡出）。
+        #      它压在薄面**之下** —— 染色是玻璃的事，不能拿文字区的可读性去换。
+        self._paint_ambient(p, path, rect)
 
-        # 底部内阴影：交代材质下沉，玻璃不是一块平板。
-        # 它压着状态栏文字，所以不透明度是令牌（BOTTOM_SHADE），要跟对比度一起调。
-        shade = QLinearGradient(0.0, self.height() * 0.72, 0.0, self.height())
-        shade.setColorAt(0.0, QColor(0, 0, 0, 0))
-        shade.setColorAt(1.0, wash(BOTTOM_SHADE / 255.0))
+        # ② 文字区薄面：整窗只有 44%（桌面真的上得来），所以有字的区域各自垫一层浅面，
+        #    把该区的亮度下限抬回 AA。面只铺在「有字的那几条」，图片口这种大块内容保持
+        #    真透 —— 大面积真透 + 小面积厚度，「高级」是这么来的。两层都向内容区渐隐，
+        #    所以分区之间没有硬边。
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(shade)
         p.save()
         p.setClipPath(path)
-        p.drawRect(QRectF(0.0, self.height() * 0.72, self.width(), self.height() * 0.28))
+        self._paint_top_face(p)
+        self._paint_foot_face(p)
         p.restore()
+
+        # ③ 边缘收束：先铺受光边的内圈薄光（光源那侧的「被照亮的一条边」，跟着指针转），
+        #    再压上焦散 + 镜面边缘光 —— 那圈细亮边是「玻璃」的签名，不能被薄面盖掉。
+        paint_edge_glow(p, rect, radius)
+        paint_glass(
+            p, rect, radius, lit=GLASS_LIT_WINDOW, gloss=False, specular=False, aberration=False
+        )
         p.end()
+
+    def _ambient_center(self, rect: QRectF) -> QPointF:
+        """染光中心 = 图片口中心（内容在那儿，颜色就从那儿漫出来）。"""
+        port = getattr(self, "_image_port", None)
+        if port is None:
+            return rect.center()
+        return QPointF(port.mapTo(self, port.rect().center()))
+
+    def _paint_ambient(self, p: QPainter, path, rect: QRectF) -> None:
+        """内容环境光：一片跟着内容走的柔光，到窗口边缘已经淡没（不会变成一块色斑）。"""
+        if self._ambient_color is None or self._ambient_level <= 0.001:
+            return
+        level = AMBIENT_ALPHA * self._ambient_level
+        core = QColor(self._ambient_color)
+        core.setAlphaF(level)
+        mid = QColor(self._ambient_color)
+        mid.setAlphaF(level * 0.35)
+        glow = QRadialGradient(
+            self._ambient_center(rect), AMBIENT_SPREAD * max(self.width(), self.height())
+        )
+        glow.setColorAt(0.0, core)
+        glow.setColorAt(0.55, mid)
+        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.save()
+        p.setClipPath(path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(glow)
+        p.drawRect(rect)
+        p.restore()
+
+    def _paint_top_face(self, p: QPainter) -> None:
+        """顶栏浅面 + 最上沿再亮一档，往下渐隐进内容（顶栏亮 → 内容中）。"""
+        band = QRectF(0.0, 0.0, float(self.width()), TOPBAR_H * FACE_FALLOFF)
+        sheen = QLinearGradient(band.topLeft(), band.bottomLeft())
+        sheen.setColorAt(0.0, QColor(255, 255, 255, round(255 * (TOPBAR_FACE + TOPBAR_SHEEN))))
+        sheen.setColorAt(TOPBAR_H / band.height(), QColor(255, 255, 255, round(255 * TOPBAR_FACE)))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setBrush(sheen)
+        p.drawRect(band)
+
+    def _paint_foot_face(self, p: QPainter) -> None:
+        """状态栏浅面 + 底部内阴影：一档亮（面）一档深（影），沉下去而字仍清楚。"""
+        band_h = STATUSBAR_H * FACE_FALLOFF
+        band = QRectF(0.0, self.height() - band_h, float(self.width()), band_h)
+        face = QLinearGradient(band.topLeft(), band.bottomLeft())
+        face.setColorAt(0.0, QColor(255, 255, 255, 0))
+        floor = QColor(255, 255, 255, round(255 * STATUSBAR_FACE))
+        face.setColorAt(1.0 - STATUSBAR_H / band_h, floor)
+        face.setColorAt(1.0, floor)
+        p.setBrush(face)
+        p.drawRect(band)
+        # 底部内阴影：交代材质下沉，玻璃不是一块平板。
+        # 它压着状态栏文字，所以不透明度是令牌（BOTTOM_SHADE），要跟对比度一起调。
+        shade = QLinearGradient(0.0, self.height() * 0.72, 0.0, float(self.height()))
+        shade.setColorAt(0.0, QColor(0, 0, 0, 0))
+        shade.setColorAt(1.0, wash(BOTTOM_SHADE / 255.0))
+        p.setBrush(shade)
+        p.drawRect(QRectF(0.0, self.height() * 0.72, float(self.width()), self.height() * 0.28))
 
     def keyPressEvent(self, e) -> None:  # noqa: N802
         # 无边框窗口要给出可预期的「出口」（Esc = 关闭）

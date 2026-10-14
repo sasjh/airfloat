@@ -3,8 +3,11 @@
 实测结论（Windows 11 25H2 / Qt 6.12）：
   - DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE) 在 Qt 的分层窗口上会退化成
     一块不透明的浅色填充，看不到背后的桌面；
-  - SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND) 才是真正把窗口
-    背后的内容做高斯模糊的方案。
+  - SetWindowCompositionAttribute 才能真把窗口背后的内容做高斯模糊。但**两种**都要挑：
+    ACCENT_ENABLE_ACRYLICBLURBEHIND（亚克力）在 Windows 11 上会额外叠一层**系统乳白**，
+    它不跟着我们的令牌走 —— 整窗压上一片奶白，桌面再透也上不来，看起来就是「廉价的
+    塑料板」。ACCENT_ENABLE_BLURBEHIND（纯模糊）只做高斯模糊、不掺颜色，着色 / 加厚 /
+    高光全由我们自己画（styles.GLASS_TINT_ABGR + paint_glass），所以**首选纯模糊**。
 圆角的坑（实测）：亚克力模糊是 DWM 画的，**它不理会 SetWindowRgn**——只做区域裁剪的话
 四角照样会露出方形的模糊块。正解是让 DWM 自己按圆角裁剪
 （DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND，Windows 11 22H2+）；DWM 的圆角半径
@@ -105,10 +108,11 @@ class GlassMaterial:
     def attach(self, hwnd: int, tint_abgr: int) -> str:
         self._hwnd = int(hwnd)
         self._tint = tint_abgr
-        if self._apply_accent(ACCENT_ENABLE_ACRYLICBLURBEHIND, tint_abgr):
-            self._mode = MODE_ACRYLIC
-        elif self._apply_accent(ACCENT_ENABLE_BLURBEHIND, tint_abgr):
+        # 首选纯模糊（系统不掺色），亚克力只作兜底：乳白那一层会把我们自己的光影糊掉。
+        if self._apply_accent(ACCENT_ENABLE_BLURBEHIND, tint_abgr):
             self._mode = MODE_BLUR
+        elif self._apply_accent(ACCENT_ENABLE_ACRYLICBLURBEHIND, tint_abgr):
+            self._mode = MODE_ACRYLIC
         else:
             self._mode = MODE_SOLID
         self._apply_rounding()
