@@ -8,7 +8,8 @@
 - 弹出菜单：三项、勾选行跟随当前取值、选中即回传 receive_mode_changed；
 - 图片口：每张缩略图都有删除键，删除只影响列表与待发送队列；
 - 移动：拖窗口期间不降级材质（亚克力一路都在，桌面在玻璃底下跟着走）；
-- 对比度：深色文字按「最暗底」、白色字形按「最亮底」校准，达 WCAG AA。
+- 对比度：文字按「最暗底」逐层压出来校；白色字形按「最亮底」校。
+  近透档（整窗薄面 0.30）≥ 2.6:1，厚面档（薄面 0.52）≥ 4.5:1 —— 两档的数都摆在 §13 里。
 - 空态：图片口裸透（自己不画任何东西），亮字只有一档不透明度、周围不垫任何东西。
 """
 
@@ -85,6 +86,16 @@ def _glass_probe(**kwargs) -> QImage:
     image.fill(QColor(0, 0, 0, 0))
     painter = QPainter(image)
     ui_liquid.paint_glass(painter, QRectF(0.5, 0.5, 79.0, 39.0), 10.0, **kwargs)
+    painter.end()
+    return image
+
+
+def _glow_probe(light: QPointF | None = None) -> QImage:
+    """只画「受光边那圈薄光」的离屏小图（80x40 的玻璃片）。"""
+    image = QImage(80, 40, QImage.Format.Format_ARGB32)
+    image.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(image)
+    ui_liquid.paint_edge_glow(painter, QRectF(0.5, 0.5, 79.0, 39.0), 10.0, light=light)
     painter.end()
     return image
 
@@ -180,14 +191,22 @@ def main() -> int:
     print("\n[3] 材质")
     check("材质对象存在", window._material is not None)
     check("材质模式可读", window._material.mode in ("acrylic", "blur", "solid"), window._material.mode)
-    # 圆角：模糊是 DWM 画的、不认窗口区域，所以必须让 DWM 自己圆角（常量接线要对），
-    # 而窗口自己的裁剪半径要与 DWM 的系统半径一致，避免出现两条不同心的弧。
+    # 圆角有**两套**半径，用哪套取决于「谁在裁那层模糊」（见 glass.region_clips_backdrop）：
+    # 纯模糊时模糊跟着窗口区域走（实测 16px 的区域把模糊也裁圆了），圆角归我们管 —— 想多
+    # 圆有多圆，同时必须让 DWM 别插手；亚克力兜底时模糊由 DWM 画、不认区域，圆角只能交给
+    # DWM，半径是系统固定的那档，我们画的弧得跟它同半径，否则四角出现两条不同心的弧。
     check("glass 接的是 DWM 圆角偏好",
-          ui_glass.DWMWA_WINDOW_CORNER_PREFERENCE == 33 and ui_glass.DWMWCP_ROUND == 2)
-    check("窗口裁剪半径 = RADIUS_WINDOW 令牌",
-          window._material._region_key is not None and window._material._region_key[2] == mw.RADIUS_WINDOW,
+          ui_glass.DWMWA_WINDOW_CORNER_PREFERENCE == 33 and ui_glass.DWMWCP_ROUND == 2
+          and ui_glass.DWMWCP_DONOTROUND == 1)
+    check("窗口裁剪半径 = 当前生效的那套圆角令牌（绘制与裁剪同一个值）",
+          window._material._region_key is not None
+          and window._material._region_key[2] == window._window_radius(),
           str(window._material._region_key))
-    check("RADIUS_WINDOW 与文档一致（8）", mw.RADIUS_WINDOW == 8, str(mw.RADIUS_WINDOW))
+    check("整套半径与文档一致：自己裁 16 / 系统裁 8",
+          (mw.RADIUS_WINDOW, mw.RADIUS_WINDOW_SYSTEM) == (16, 8),
+          f"{mw.RADIUS_WINDOW} / {mw.RADIUS_WINDOW_SYSTEM}")
+    check("两条圆角规则互斥：DWM 在裁圆角时，区域就不再负责裁模糊（不会各裁一刀）",
+          not (window._material.rounded_by_dwm and window._material.region_clips_backdrop))
 
     print("\n[4] 模块卡片：状态显示")
     window.on_state({"enabled": True, "receiveMode": "everyone", "alias": "我的电脑"})
@@ -300,22 +319,40 @@ def main() -> int:
     # 三层全部取自令牌，所以动了其中任何一个都会在这里被重新校验，不会悄悄漂移。
     tint_alpha = ((styles.GLASS_TINT_ABGR >> 24) & 0xFF) / 255.0
     floor_bg = _flatten(styles.BG, tint_alpha, "#000000")      # 玻璃压纯黑桌面（图片口 = 最透处）
-    page_bg = _flatten(styles.CARD, styles.SIDEBAR_FACE, floor_bg)      # + 文字区薄面（侧栏 / 顶栏）
-    status_bg = _flatten(styles.CARD, styles.STATUSBAR_FACE, floor_bg)  # 状态栏：同一层薄面
-    worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0, status_bg)  # + 底部内阴影
-    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 文字区薄面 + 底影 = #8F9090", worst == "#8F9090", worst)
-    # 顶栏亮 → 内容中 → 状态栏沉：底影得看得见，但薄面厚到不吃掉 AA（上面那条就是它）。
-    check("状态栏仍比侧栏沉一档（底影在起作用）",
+    page_bg = _flatten(styles.CARD, styles.SIDEBAR_FACE, floor_bg)   # 侧栏 = 顶栏 = 状态栏（同一档）
+    worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0, page_bg)  # + 底部内阴影
+    check(f"最差底 = 玻璃@{tint_alpha:.0%} + 薄面@{styles.SIDEBAR_FACE:.0%} + 底影 = #5F6061",
+          worst == "#5F6061", worst)
+    check("整窗薄面只有一档（三处同价，不做位置差价）",
+          styles.SIDEBAR_FACE == styles.TOPBAR_FACE == styles.STATUSBAR_FACE,
+          f"{styles.SIDEBAR_FACE} / {styles.TOPBAR_FACE} / {styles.STATUSBAR_FACE}")
+    # 顶栏亮 → 内容中 → 状态栏沉：底影得看得见，但不能把字吃掉（上面那条就是它）。
+    check("底影把最差底又压下去一档（状态栏仍比顶栏沉）",
           _contrast(styles.TEXT, worst) < _contrast(styles.TEXT, page_bg))
     # 深色文字按 worst（最暗底）校；白色字形反过来按 lightest（最亮底 = 纯白壁纸）校。
     lightest = _flatten(styles.BG, tint_alpha, "#FFFFFF")
+    # 整窗现在走的是**近透档**（薄面 0.30）：桌面几乎原样上得来，代价就是深色字压在深色桌面上
+    # 只剩 2.6~2.9:1 —— 这是**刻意的取舍**（用户一路把侧栏 / 上栏 / 下栏都推到这一档），
+    # 所以口径是「比裸玻璃（1.02:1）好得多、且三支墨都还拿得出手」，不再套 AA。
+    # 想换回 AA 只需要把薄面调回 0.52 —— 下面那条对照就是给这件事留的凭据：同一套字色，
+    # 薄面回到 0.52 时三支墨都 ≥ 4.5:1。透明度和对比度在这个材质里就是一根跷跷板。
     for name, color, floor in (
-        ("主文字 TEXT", styles.TEXT, 4.5),
-        ("次要文字 TEXT_SECONDARY", styles.TEXT_SECONDARY, 4.5),
-        ("成功文字 SUCCESS", styles.SUCCESS, 4.5),
+        ("主文字 TEXT", styles.TEXT, 2.8),
+        ("次要文字 TEXT_SECONDARY", styles.TEXT_SECONDARY, 2.7),
+        ("成功文字 SUCCESS", styles.SUCCESS, 2.6),
     ):
         ratio = _contrast(color, worst)
-        check(f"{name} {ratio:.2f}:1 ≥ {floor}", ratio >= floor)
+        check(f"{name} {ratio:.2f}:1 ≥ {floor}（近透档）", ratio >= floor)
+    check("但三支墨都比裸玻璃上强太多（薄面不是白加的）",
+          min(_contrast(c, worst) for c in (styles.TEXT, styles.TEXT_SECONDARY, styles.SUCCESS))
+          > 2.0 * _contrast(styles.TEXT, floor_bg))
+    aa_worst = _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0,
+                       _flatten(styles.CARD, 0.52, floor_bg))
+    aa_ratios = [_contrast(c, aa_worst) for c in
+                 (styles.TEXT, styles.TEXT_SECONDARY, styles.SUCCESS)]
+    check(f"薄面调回 0.52 时同一套字色 ≥ 4.5:1（AA）：{aa_ratios[1]:.2f} —— "
+          f"透明是**换**来的，不是白得的",
+          all(r >= 4.5 for r in aa_ratios), str([round(r, 2) for r in aa_ratios]))
     # 图片口是整窗最透的一处：深色文字在这儿根本压不住（上面那条就是它），所以空态提示走
     # 参考图（iOS「Clear」面板）那条路 —— **亮字、只有一档不透明度**，周围不垫任何东西。
     # 参考图里那行白字就是直接压在墙上，靠字号 / 字重立层级，不是靠加底。加底反而会在
@@ -332,11 +369,12 @@ def main() -> int:
           not any(hasattr(styles, name) for name in
                   ("HINT_SCRIM", "HINT_HALO", "HINT_FEATHER", "HINT_PAD_X", "HINT_PAD_Y")))
     # 设备行悬停是**亮**一档（悬停 = 更靠近手指 = 光更足），不是压暗 —— 行内是次要文字，
-    # 压暗会把它先推到 AA 以下。
+    # 压暗会把它先推到读不清；亮一档反而把底抬起来，近透档下悬停那行的字比常态更好读。
     hover_bg = _flatten(styles.CARD, styles.ROW_HOVER_FACE, page_bg)
     hover_ratio = _contrast(styles.TEXT_SECONDARY, hover_bg)
-    check(f"设备行悬停底更亮，行内次要文字仍 {hover_ratio:.2f}:1 ≥ 4.5",
-          styles.ROW_HOVER_FACE > 0 and hover_ratio >= 4.5, hover_bg)
+    rest_ratio = _contrast(styles.TEXT_SECONDARY, page_bg)
+    check(f"设备行悬停底更亮，行内次要文字从 {rest_ratio:.2f} 升到 {hover_ratio:.2f}:1（≥ 常态 × 1.25）",
+          styles.ROW_HOVER_FACE > 0 and hover_ratio >= rest_ratio * 1.25, hover_bg)
     for name, fg, bg, floor in (
         ("强调色上的白字", "#FFFFFF", styles.ACCENT, 4.5),
         ("圆钮白字形", "#FFFFFF", styles.ACCENT_ICON, 3.0),
@@ -373,10 +411,12 @@ def main() -> int:
     light_field._current = light_field._target = QPointF(*styles.GLASS_LIGHT_REST)
     # 一层一层验：高光强度可关（lit=0 必须全透明，绝不挡住背后的真实模糊）
     check("lit=0 ⇒ 整块透明（高光强度可控）", _peak_alpha(_glass_probe(lit=0.0), QRect(0, 0, 79, 39)) == 0)
-    # 默认只画光影：内部透明、边缘发光 —— 玻璃是「边缘在反光」，不是一块实心贴纸
+    # 默认只画光影：内部透明、边缘发光 —— 玻璃是「边缘在反光」，不是一块实心贴纸。
+    # 「远离高光处」得取**对角**的那个角：光轴锚点现在落在**边上**（见 liquid._edge_hit），
+    # 静息光位下镜面热点就贴着上边中段，离它最远的是右下角。
     rim = _glass_probe()
-    check("内部保持透明（远离高光处不实心挡底）", rim.pixelColor(60, 33).alpha() == 0,
-          str(rim.pixelColor(60, 33).alpha()))
+    check("内部保持透明（对角那一侧不实心挡底）", rim.pixelColor(77, 37).alpha() == 0,
+          str(rim.pixelColor(77, 37).alpha()))
     top_edge, bottom_edge = QRect(30, 0, 20, 2), QRect(30, 38, 20, 2)
     check("受光边（上）有镜面高光", _peak_alpha(rim, top_edge) > 0)
     check("背光边（下）比受光边淡", _peak_alpha(rim, top_edge) > _peak_alpha(rim, bottom_edge),
@@ -620,7 +660,8 @@ def main() -> int:
           borrow("#FFFFFF").valueF() <= styles.AMBIENT_VALUE_CEIL + 1e-3
           and borrow("#000000").valueF() >= styles.AMBIENT_VALUE_FLOOR - 1e-3,
           f"{borrow('#FFFFFF').valueF():.2f} / {borrow('#000000').valueF():.2f}")
-    # 环境光压在薄面**之下**，但仍要按「最暗底」把 AA 守住（染色不许拿可读性去换）
+    # 环境光压在薄面**之下**，所以最坏情况也只是把底色轻微挪一点（染色不许拿可读性去换）：
+    # 按最暗的那种借色重算，对比度掉幅必须很小（近透档已经只有 2.7:1，再掉就真读不清了）。
     darkest_borrow = QColor.fromHsvF(0.0, styles.AMBIENT_MIX, styles.AMBIENT_VALUE_FLOOR)
     with_ambient = _flatten(
         "#%02X%02X%02X" % (darkest_borrow.red(), darkest_borrow.green(), darkest_borrow.blue()),
@@ -633,7 +674,11 @@ def main() -> int:
         _flatten(styles.CARD, styles.SIDEBAR_FACE, with_ambient),
     )
     ratio = _contrast(styles.TEXT_SECONDARY, ambient_worst)
-    check(f"叠上内容环境光后，最差底仍 {ratio:.2f}:1 ≥ 4.5", ratio >= 4.5, ambient_worst)
+    plain = _contrast(styles.TEXT_SECONDARY,
+                      _flatten(styles.RECESS_WASH, styles.BOTTOM_SHADE / 255.0,
+                               _flatten(styles.CARD, styles.SIDEBAR_FACE, floor_bg)))
+    check(f"叠上最暗的借色后对比度几乎不掉（{ratio:.2f} vs 不染色 {plain:.2f}，掉幅 < 5%）",
+          ratio >= plain * 0.95, ambient_worst)
     item = {"file_path": paths[0], "file_name": "borrow.png"}
     window._settle_ambient(item)
     QTest.qWait(styles.AMBIENT_SETTLE_MS + 200)
@@ -689,6 +734,25 @@ def main() -> int:
           f"{port_faces} / {port_glows}")
     check("受光边那圈薄光真的画在窗口上（跟着全局光位）",
           shell_glows == 1 and glows[0].get("light") is None, str(glows))
+    # 薄光的**锚点必须在边上**。斜光位下把锚点取在窗口里面（旧写法 center + (dx·w/2,
+    # dy·h/2) 恰恰就是里面那个点）会让 QLinearGradient 的 PadSpread 把「锚点以外」整片补成
+    # 第一档颜色：玻璃上凭空出现一大片**平铺的光**，还带着一条笔直的边 —— 这就是用户说的
+    # 「光好廉价」。实测旧写法在对角（背光侧）也有 26/255 的光，新写法是 0。
+    # 所以守两条：亮只压在光源那侧（对角必须是 0）+ 往里很快淡。
+    glow_rest = _glow_probe(QPointF(*styles.GLASS_LIGHT_REST))
+    edge_peak = _peak_alpha(glow_rest, QRect(3, 1, 20, 3))
+    inner_peak = _peak_alpha(glow_rest, QRect(28, 14, 24, 8))
+    far_peak = _peak_alpha(glow_rest, QRect(58, 30, 18, 8))
+    check("受光薄光只压在光源那侧：背光的对角一个像素都不亮（锚点在边上，不在窗口里面）",
+          far_peak == 0, str(far_peak))
+    check("薄光贴着光源那条边、往里很快淡（内部 ≤ 边上的 1/3）",
+          edge_peak > 0 and inner_peak * 3 <= edge_peak, f"{edge_peak} vs {inner_peak}")
+    jumps = []
+    for row in (8, 20, 32):
+        line = [glow_rest.pixelColor(x, row).alpha() for x in range(3, 77)]
+        jumps.extend(abs(b - a) for a, b in zip(line, line[1:]))
+    check(f"薄光过渡是连续的（扫描线上相邻落差最大 {max(jumps)}/255 ≤ 12）", max(jumps) <= 12,
+          str(max(jumps)))
     # 图片口现在是**裸透**：它自己不画任何东西 —— 没有托盘洗、没有光池、没有描边。空态那
     # 两行亮字是**子控件**画的，且不带底 / 框 / 滤镜。于是「该有的像素」只剩中间一小块，
     # 四角 / 四边必须是 0：铺满整块的洗、或一大片光池（在 13% 的玻璃上就是中间一团发灰的

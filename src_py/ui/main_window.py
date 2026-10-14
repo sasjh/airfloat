@@ -123,6 +123,7 @@ from .styles import (
     RADIUS_CONTROL,
     RADIUS_MENU,
     RADIUS_WINDOW,
+    RADIUS_WINDOW_SYSTEM,
     RECESS_WASH,
     ROW_HOVER_FACE,
     SEND_WELL,
@@ -1909,18 +1910,26 @@ class AirFloatWindow(QWidget):
     def _update_region(self) -> None:
         """窗口内容裁进圆角区域。
 
-        DWM 自己画的模糊不认窗口区域，圆角由 glass 的 DWMWA_WINDOW_CORNER_PREFERENCE
-        负责；半径取自 styles.RADIUS_WINDOW，两边必须一致。
+        半径由 `_window_radius()` 给：谁在裁那层模糊，圆角就归谁 —— 纯模糊时区域裁得住
+        模糊，圆角归我们（想多圆有多圆）；亚克力兜底时模糊由 DWM 画、圆角也归 DWM，
+        半径只能跟系统那档。绘制与裁剪取同一个值，四角就不会出现两条不同心的弧。
         """
         if not self._glass_ready:
             return
         self._material.set_rounded(
             self.width(),
             self.height(),
-            RADIUS_WINDOW,
+            self._window_radius(),
             self.devicePixelRatioF(),
             enabled=not self.isMaximized(),
         )
+
+    def _window_radius(self) -> int:
+        """当前生效的整窗圆角半径（绘制与裁剪共用这一个值）。"""
+        material = getattr(self, "_material", None)
+        if material is not None and not material.region_clips_backdrop:
+            return RADIUS_WINDOW_SYSTEM
+        return RADIUS_WINDOW
 
     def _edges_at(self, pos: QPoint):
         margin = RESIZE_MARGIN
@@ -2039,7 +2048,7 @@ class AirFloatWindow(QWidget):
         """窗口外壳：透玻璃 + 文字区薄面 —— 整窗真透，有字的地方局部加厚。"""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        radius = 0 if self.isMaximized() else RADIUS_WINDOW
+        radius = 0 if self.isMaximized() else self._window_radius()
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         path = glass_path(rect, radius)
 

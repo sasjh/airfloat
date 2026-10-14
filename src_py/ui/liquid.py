@@ -33,6 +33,7 @@ import math
 
 from PySide6.QtCore import (
     QEasingCurve,
+    QElapsedTimer,
     QObject,
     QPointF,
     QRectF,
@@ -56,11 +57,14 @@ from .styles import (
     GLASS_CAUSTIC,
     GLASS_CAUSTIC_INSET,
     GLASS_EDGE_GLOW,
+    GLASS_EDGE_HOTSPOT,
+    GLASS_EDGE_HOTSPOT_R,
     GLASS_EDGE_GLOW_WIDTH,
     GLASS_GLOSS,
     GLASS_INNER_SHADOW,
     GLASS_LIGHT_EASE,
     GLASS_LIGHT_REST,
+    GLASS_LIGHT_SETTLE,
     GLASS_LIGHT_SHIFT,
     GLASS_RIM_BOTTOM,
     GLASS_RIM_TOP,
@@ -122,6 +126,7 @@ class LightField(QObject):
         super().__init__()
         self._current = QPointF(*GLASS_LIGHT_REST)
         self._target = QPointF(*GLASS_LIGHT_REST)
+        self._clock = QElapsedTimer()
         self._timer = QTimer(self)
         self._timer.setInterval(LIGHT_TICK_MS)
         self._timer.timeout.connect(self._step)
@@ -141,15 +146,21 @@ class LightField(QObject):
             _clamp_unit((local.y() - rect.height() / 2.0) / (rect.height() / 2.0)),
         )
         if not self._timer.isActive():
+            self._clock.restart()
             self._timer.start()
 
     def _step(self) -> None:
+        # 按**真实间隔**归一：掉帧时这一步就大一点，光不会因为卡了一下而走成一段一段的
+        # （心跳固定 16ms 只是「最密的步子」，不是「必须等 16ms」）。上限 100ms：真卡了
+        # 宁可多花几帧追上，也不要一步跳到指针那儿 —— 那一下就是「瞬移」，黏度就没了。
+        dt = max(1.0, min(float(self._clock.restart()), 100.0))
+        ease = 1.0 - (1.0 - GLASS_LIGHT_EASE) ** (dt / LIGHT_TICK_MS)
         delta = self._target - self._current
-        if abs(delta.x()) < 0.005 and abs(delta.y()) < 0.005:
+        if abs(delta.x()) < GLASS_LIGHT_SETTLE and abs(delta.y()) < GLASS_LIGHT_SETTLE:
             self._current = QPointF(self._target)
             self._timer.stop()
         else:
-            self._current += delta * GLASS_LIGHT_EASE
+            self._current += delta * ease
         self.moved.emit()
 
 
@@ -189,12 +200,32 @@ def _light_unit(light: QPointF | None) -> tuple[float, float]:
     return dx / length, dy / length
 
 
-def _light_axis(rect: QRectF, light: QPointF | None) -> tuple[QPointF, QPointF]:
-    """沿光轴取两个端点：光源侧（亮）与背光侧（暗）。"""
-    dx, dy = _light_unit(light)
+def _edge_hit(rect: QRectF, dx: float, dy: float) -> tuple[QPointF, QPointF]:
+    """光轴打到窗口**边**上的那个点，以及那条边的**向内法线**。
+
+    这里是「光脏」的根源，值得写清楚：以前锚点取的是 ``center + (dx*w/2, dy*h/2)``，
+    斜光位下那是窗口**里面**的一个点（比如 (0.72,0.72) 落在右下角内侧 80px 处）。而
+    ``QLinearGradient`` 在起点以外是 **PadSpread** —— 整片补成第一档颜色。于是那圈受光
+    薄光在玻璃中间切出一条笔直的分界，看着像贴了一张膜（用户说的「光好廉价」）。
+    锚点必须真的落在边上，渐变才只往窗口**里**走。
+    """
     center = rect.center()
-    span = QPointF(dx * rect.width() / 2.0, dy * rect.height() / 2.0)
-    return center + span, center - span
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return center, QPointF(0.0, 0.0)
+    sx = (rect.width() / 2.0) / abs(dx) if abs(dx) > 1e-9 else math.inf
+    sy = (rect.height() / 2.0) / abs(dy) if abs(dy) > 1e-9 else math.inf
+    if sx <= sy:
+        return (QPointF(rect.left() if dx < 0 else rect.right(), center.y()),
+                QPointF(-1.0 if dx > 0 else 1.0, 0.0))
+    return (QPointF(center.x(), rect.top() if dy < 0 else rect.bottom()),
+            QPointF(0.0, -1.0 if dy > 0 else 1.0))
+
+
+def _light_axis(rect: QRectF, light: QPointF | None) -> tuple[QPointF, QPointF]:
+    """沿光轴取两个端点：光源侧（亮，**正好在边上**）与背光侧（暗，对称落在里面）。"""
+    dx, dy = _light_unit(light)
+    light_side, _ = _edge_hit(rect, dx, dy)
+    return light_side, rect.center() * 2.0 - light_side
 
 
 def paint_glass(
@@ -342,27 +373,43 @@ def paint_edge_glow(
     *,
     light: QPointF | None = None,
 ) -> None:
-    """受光边那圈内圈薄光：沿光源那侧的一条亮带，向内很快淡掉。
+    """受光边那圈内圈薄光：沿光源那侧的一条亮带 + 边正中一小朵沿边的柔光。
 
     大面板上的取舍：铺**面**就是奶白（一块几万像素的板，任何一层柔光都会糊成一片），
     完全不给光又变成一块死玻璃。所以只给**边** —— 而且宽度是**像素**（不是比例），
     窗口放大时它不会跟着摊开。光跟着指针走，这条亮带就绕着窗口转。
+
+    细节（用户：光别太明显、但要更细）：亮带本身分**三段**淡出（贴边一线最亮 → 快速跌
+    下去 → 拖一条长尾），再叠一小朵**沿边**的柔光。后者是关键 —— 只有一条均匀亮带时，
+    灯一挪整条边一起变亮，看着像贴纸；有了这朵沿边的光，亮的地方在边上**走**，才是光。
     """
-    if GLASS_EDGE_GLOW <= 0:
+    if GLASS_EDGE_GLOW <= 0 and GLASS_EDGE_HOTSPOT <= 0:
         return
     dx, dy = _light_unit(light)
-    light_side = rect.center() + QPointF(dx * rect.width() / 2.0, dy * rect.height() / 2.0)
-    inner = light_side - QPointF(dx * GLASS_EDGE_GLOW_WIDTH, dy * GLASS_EDGE_GLOW_WIDTH)
-    band = QLinearGradient(light_side, inner)
-    band.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_EDGE_GLOW)))
-    band.setColorAt(0.45, QColor(255, 255, 255, round(255 * GLASS_EDGE_GLOW * 0.35)))
-    band.setColorAt(1.0, QColor(255, 255, 255, 0))
+    light_side, normal = _edge_hit(rect, dx, dy)
+    inner = light_side + normal * GLASS_EDGE_GLOW_WIDTH
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setClipPath(glass_path(rect, radius))
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(band)
-    painter.drawRect(rect)
+    if GLASS_EDGE_GLOW > 0:
+        band = QLinearGradient(light_side, inner)
+        for stop, level in ((0.0, 1.0), (0.18, 0.42), (0.52, 0.11), (1.0, 0.0)):
+            band.setColorAt(stop, QColor(255, 255, 255, round(255 * GLASS_EDGE_GLOW * level)))
+        painter.setBrush(band)
+        painter.drawRect(rect)
+    if GLASS_EDGE_HOTSPOT > 0:
+        # 光沿**最近的那条边**走：横向光就落在左 / 右边中，纵向光就落在上 / 下边中 ——
+        # 这朵光就压在 `light_side` 上（它已经在边上了），沿边走、往里淡。
+        edge_len = rect.height() if normal.x() != 0.0 else rect.width()
+        spot = QRadialGradient(light_side, max(edge_len * GLASS_EDGE_HOTSPOT_R, 1.0))
+        # 过渡点给密一点（近似指数衰减）：三点式的径向渐变在玻璃上会显出一圈「外沿」，
+        # 那不是光，那是渐变的边。
+        for stop, level in ((0.0, 1.0), (0.16, 0.70), (0.34, 0.42), (0.54, 0.21),
+                            (0.74, 0.08), (0.88, 0.02), (1.0, 0.0)):
+            spot.setColorAt(stop, QColor(255, 255, 255, round(255 * GLASS_EDGE_HOTSPOT * level)))
+        painter.setBrush(spot)
+        painter.drawRect(rect)
     painter.restore()
 
 

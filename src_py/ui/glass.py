@@ -33,6 +33,7 @@ WCA_ACCENT_POLICY = 19
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
 DWMWA_BORDER_COLOR = 34
 DWMWCP_ROUND = 2
+DWMWCP_DONOTROUND = 1
 DWMWA_COLOR_NONE = 0xFFFFFFFE
 
 MODE_ACRYLIC = "acrylic"
@@ -103,6 +104,18 @@ class GlassMaterial:
         """DWM 是否接管了圆角裁剪（模糊才会跟着圆）。"""
         return self._rounded_by_dwm
 
+    @property
+    def region_clips_backdrop(self) -> bool:
+        """窗口区域能不能裁住那层模糊 —— 判断「圆角该归谁管」的唯一依据。
+
+        纯模糊（``ACCENT_ENABLE_BLURBEHIND``）时，那层模糊是 DWM **按窗口区域**画的：
+        实测把区域设成 16px 圆角，四角连模糊一起被裁得干干净净（见开发日志）。这时圆角
+        归我们管，想多圆有多圆。亚克力兜底时模糊是系统 backdrop、不认窗口区域，圆角只能
+        交给 DWM，而它的半径是系统固定的 —— 这就是两套半径的来由（styles.RADIUS_WINDOW
+        / RADIUS_WINDOW_SYSTEM）。
+        """
+        return self._mode != MODE_ACRYLIC
+
     # ------------------------------------------------------------------ 应用
 
     def attach(self, hwnd: int, tint_abgr: int) -> str:
@@ -115,7 +128,7 @@ class GlassMaterial:
             self._mode = MODE_ACRYLIC
         else:
             self._mode = MODE_SOLID
-        self._apply_rounding()
+        self._apply_rounding(rounded=not self.region_clips_backdrop)
         return self._mode
 
     def set_tint(self, tint_abgr: int) -> None:
@@ -138,7 +151,7 @@ class GlassMaterial:
     def _reapply(self) -> None:
         state = ACCENT_ENABLE_BLURBEHIND if self._mode == MODE_BLUR else ACCENT_ENABLE_ACRYLICBLURBEHIND
         self._apply_accent(state, self._tint)
-        self._apply_rounding()
+        self._apply_rounding(rounded=not self.region_clips_backdrop)
 
     def _apply_accent(self, state: int, tint_abgr: int) -> bool:
         if not self._user32 or self._hwnd is None:
@@ -156,12 +169,17 @@ class GlassMaterial:
 
     # ------------------------------------------------------------------ 圆角
 
-    def _apply_rounding(self) -> bool:
-        """让 DWM 按系统圆角裁掉窗口四角（含它自己画的模糊），并去掉默认边框线。"""
+    def _apply_rounding(self, *, rounded: bool = True) -> bool:
+        """圆角交给 DWM（``rounded=True``）还是让开（``rounded=False``），并去掉默认边框线。
+
+        ``rounded=False`` 不是「不圆角」，而是「**别插手**」：我们自己用窗口区域裁，半径
+        才不受系统那个固定值约束。两者必须二选一 —— 同时开着的话，DWM 会按它的小半径
+        再裁一刀，四角就出现两条不同心的弧。
+        """
         if not self._dwmapi or self._hwnd is None:
             return False
         try:
-            pref = ctypes.c_int(DWMWCP_ROUND)
+            pref = ctypes.c_int(DWMWCP_ROUND if rounded else DWMWCP_DONOTROUND)
             ok = self._dwmapi.DwmSetWindowAttribute(
                 wintypes.HWND(self._hwnd),
                 DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -175,7 +193,7 @@ class GlassMaterial:
                 ctypes.byref(border),
                 ctypes.sizeof(border),
             )
-            self._rounded_by_dwm = ok == 0
+            self._rounded_by_dwm = rounded and ok == 0
         except Exception:
             self._rounded_by_dwm = False
         return self._rounded_by_dwm
