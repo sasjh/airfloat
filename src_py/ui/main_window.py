@@ -1840,7 +1840,7 @@ class AirFloatWindow(QWidget):
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
-        self._backdrop.refresh_throttled()
+        self._backdrop.request_throttled()
         self._position_toast()
         self._sync_columns()
         if self._resize_session is not None:
@@ -1850,7 +1850,7 @@ class AirFloatWindow(QWidget):
 
     def moveEvent(self, e) -> None:  # noqa: N802
         super().moveEvent(e)
-        self._backdrop.refresh_throttled()
+        self._backdrop.request_throttled()
 
     def changeEvent(self, e) -> None:  # noqa: N802
         super().changeEvent(e)
@@ -1996,7 +1996,8 @@ class AirFloatWindow(QWidget):
         缩放仍然降级 —— 边长每帧都在变，模糊跟不上的错位比降级更显眼。
 
         自绘的底也跟着走（moveEvent 里限速重抓）：窗口在动，背后的桌面也得跟着动，
-        不然玻璃就像贴在一张旧照片上。限速到 ~14 次/秒，够跟手又不掉帧。
+        不然玻璃就像贴在一张旧照片上。重抓走 ``request``（抓 + 糊都在工作线程），
+        限速到 ~14 次/秒：UI 线程全程只花重绘那几毫秒，拖动才是顺的。
         """
         self._move_session = {"origin": global_pos, "geometry": QRect(self.geometry())}
 

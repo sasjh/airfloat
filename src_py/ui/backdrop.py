@@ -22,7 +22,7 @@ import sys
 import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 
 from .styles import (
@@ -165,6 +165,12 @@ class Backdrop(QObject):
 
     抓不到的机器（受保护内容、抓屏被策略挡掉）会一直返回 False，窗口据此退回 DWM
     那层系统模糊 —— 那条路四角会露出方角，但总比一块黑的好。
+
+    **抓屏 + 高斯都在工作线程里跑**（``request``），UI 线程只做最后一手贴图 —— 拖动窗口
+    时每 70ms 要重抓一张，抓 8.8ms + 糊 3.7ms 内联在 UI 线程里就是每 70ms 卡一帧（实测
+    ``refresh`` 中位 11.5ms、最坏 21ms）。分到工作线程后，拖动全程 UI 线程只花重绘那 5ms。
+    ``refresh`` 是同步版本，只留给「不在拖动、就是要立刻有一张新底」的场合（首次上屏、
+    停手复位）。
     """
 
     changed = Signal()
@@ -180,7 +186,11 @@ class Backdrop(QObject):
         self._last = 0.0  # 上一次抓成功的时间戳，给拖动时的限速跟随用
         self._timer = QTimer(self)
         self._timer.setInterval(BACKDROP_TICK_MS)
-        self._timer.timeout.connect(self.refresh)
+        self._timer.timeout.connect(self.request)
+        self._busy = False
+        self._asked = 0.0
+        self._signals = _CaptureSignals(self)
+        self._signals.done.connect(self._on_captured)
 
     # ------------------------------------------------------------------ 状态
 
@@ -221,9 +231,43 @@ class Backdrop(QObject):
         self._suspended = False
         self.refresh()
 
+    def request(self) -> bool:
+        """异步要一张新底：抓屏 + 高斯都交给工作线程，UI 线程一步不停。
+
+        同一时刻只放一张在外面（``_busy``）：抓回来会顺带把最新的位置也带回来，
+        攒着排队的旧图没有意义。
+        """
+        if self._busy or self._suspended or self._user32 is None or self._widget is None:
+            return False
+        if not self._widget.isVisible() or self._widget.isMinimized():
+            return False
+        rect = self._window_rect()
+        if rect is None:
+            return False
+        self._busy = True
+        QThreadPool.globalInstance().start(_CaptureTask(self, rect, self._signals))
+        return True
+
+    def request_throttled(self) -> bool:
+        """拖动 / 缩放时用：距上次**发起**还不到 BACKDROP_MOVE_MS 就跳过。
+
+        窗口在动的时候要一张张跟着换底，但没必要贴着每一帧发（抓 + 糊 ~13ms，就算丢到
+        工作线程，也没必要把线程池占满）—— 限到 ~14 次/秒既跟得上眼睛，又不掉帧。
+        停手后 ``resume()`` 会补一张最新的。
+        """
+        if time.monotonic() - self._asked < BACKDROP_MOVE_MS / 1000.0:
+            return False
+        self._asked = time.monotonic()
+        return self.request()
+
     # ------------------------------------------------------------------ 干活
 
     def refresh(self) -> bool:
+        """**同步**抓一张：抓屏 + 高斯就在当前线程跑完，回来时底已经换好。
+
+        只留给「不在拖动、就是要立刻有一张新底」的场合（首次上屏 / 停手复位）。
+        拖动 / 缩放那条路走 ``request``（工作线程），别在这条路上花 UI 线程的时间。
+        """
         widget = self._widget
         if self._user32 is None or widget is None:
             return False
@@ -232,25 +276,39 @@ class Backdrop(QObject):
         rect = self._window_rect()
         if rect is None:
             return False
-        image = self._grab(rect)
+        self._asked = self._last = time.monotonic()
+        image = self.grab_blurred(rect)
         if image is None:
             return False
-        pixmap = QPixmap.fromImage(_blur(image))
+        return self._adopt(image)
+
+    def grab_blurred(self, rect) -> QImage | None:
+        """抓 + 糊。纯计算，不碰任何 Qt 的界面对象 —— 所以工作线程里也敢跑。
+
+        ``_grab`` 用的是自己新建的 DC 和 ``SetWindowDisplayAffinity``（对着 hwnd，谁都能调），
+        ``_blur`` 是 Pillow / QImage 的纯数据活 —— 两样都没有「必须在 UI 线程」的约束。
+        """
+        image = self._grab(rect)
+        return None if image is None else _blur(image)
+
+    def _adopt(self, image: QImage) -> bool:
+        """把一张糊好的图变成窗口的底（QPixmap 只能在 UI 线程建，所以这一步必须在这儿）。"""
+        widget = self._widget
+        if widget is None:
+            return False
+        pixmap = QPixmap.fromImage(image)
         pixmap.setDevicePixelRatio(widget.devicePixelRatioF())
         self._pixmap = pixmap
         self._last = time.monotonic()
         self.changed.emit()
         return True
 
-    def refresh_throttled(self) -> bool:
-        """拖动 / 缩放时用：距上次抓成功还不到 BACKDROP_MOVE_MS 就跳过。
-
-        窗口在动的时候要在每一帧抓一次桌面，抓一次 ~7ms，贴着每帧抓会把拖动拖卡 ——
-        限到 ~14 次/秒既跟得上眼睛，又不掉帧。停手后 ``resume()`` 会补一张最新的。
-        """
-        if time.monotonic() - self._last < BACKDROP_MOVE_MS / 1000.0:
-            return False
-        return self.refresh()
+    def _on_captured(self, image) -> None:
+        """工作线程送回来的那张。晚到的旧图要认掉：这期间可能已经隐藏 / 暂停了。"""
+        self._busy = False
+        if image is None or self._suspended or not self._active:
+            return
+        self._adopt(image)
 
     def _window_rect(self):
         rect = wintypes.RECT()
@@ -301,6 +359,32 @@ class Backdrop(QObject):
             return None
         # RGB32：小端下字节序是 B,G,R,A，正好对上 Format_RGB32
         return QImage(raw, w, h, w * 4, QImage.Format.Format_RGB32).copy()
+
+
+class _CaptureSignals(QObject):
+    """工作线程 → UI 线程的投递口。跨线程发信号，Qt 会自动排队到 UI 线程执行。"""
+
+    done = Signal(object)  # QImage | None
+
+
+class _CaptureTask(QRunnable):
+    """在工作线程里跑一次「抓 + 糊」。
+
+    回传的是 ``QImage`` 而不是 ``QPixmap``：QPixmap 只能在 UI 线程建，QImage 可以随便传。
+    """
+
+    def __init__(self, backdrop: "Backdrop", rect, signals: _CaptureSignals) -> None:
+        super().__init__()
+        self._backdrop = backdrop
+        self._rect = rect
+        self._signals = signals
+
+    def run(self) -> None:  # pragma: no cover - 跑在工作线程里
+        try:
+            image = self._backdrop.grab_blurred(self._rect)
+        except Exception:  # 抓屏这层是 ctypes 调系统 API，宁可放掉一张也别把线程带崩
+            image = None
+        self._signals.done.emit(image)
 
 
 def _looks_blocked(raw: bytes) -> bool:

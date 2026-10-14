@@ -32,6 +32,7 @@ from PySide6.QtCore import (  # noqa: E402
     QPointF,
     QRect,
     QRectF,
+    QRunnable,
     QSettings,
     QSize,
     Qt,
@@ -254,17 +255,22 @@ def main() -> int:
     paused.attach(window)
     paused.suspend()
     check("自绘底：暂停期间不抓屏（拖动 / 缩放时不白花 CPU）", paused.refresh() is False)
-    # 拖动时窗口在动，背后的桌面也得跟着动，但不能贴着每帧抓（抓一次 ~7ms，会掉帧）：
-    # moveEvent / resizeEvent 都走限速那条路，停手后再补一张最新的。
+    # 拖动时窗口在动，背后的桌面也得跟着动；但「抓 + 糊」要 ~13ms，内联进 UI 线程就是每
+    # 70ms 卡一帧（实测 refresh 中位 11.5ms、最坏 21ms）。所以 moveEvent / resizeEvent 走
+    # request（工作线程）+ 限速，UI 线程全程只花重绘。
     throttled = ui_backdrop.Backdrop()
-    grabbed: list[int] = []
-    throttled.refresh = lambda: (grabbed.append(1), True)[1]
-    throttled._last = time.monotonic()
-    check("自绘底：限速跟随 —— 距上次抓成功太近就跳过，不白抓", throttled.refresh_throttled() is False
-          and not grabbed)
-    throttled._last = 0.0
-    check("自绘底：限速跟随 —— 够久了就抓一张（跟着窗口走）",
-          throttled.refresh_throttled() is True and grabbed == [1])
+    asked: list[int] = []
+    throttled.request = lambda: (asked.append(1), True)[1]
+    throttled._asked = time.monotonic()
+    check("自绘底：限速跟随 —— 距上次发起太近就跳过，不白抓",
+          throttled.request_throttled() is False and not asked)
+    throttled._asked = 0.0
+    check("自绘底：限速跟随 —— 够久了就发起一张（跟着窗口走）",
+          throttled.request_throttled() is True and asked == [1])
+    check("自绘底：抓+糊在工作线程里跑，UI 线程只贴图（拖动才不掉帧）",
+          "QThreadPool" in inspect.getsource(ui_backdrop.Backdrop.request)
+          and issubclass(ui_backdrop._CaptureTask, QRunnable)
+          and "QPixmap" not in inspect.getsource(ui_backdrop._CaptureTask.run))
     check("限速令牌：是个正的间隔，且不超过心跳（比心跳还疏就成了慢动作）",
           0 < styles.BACKDROP_MOVE_MS <= styles.BACKDROP_TICK_MS,
           f"{styles.BACKDROP_MOVE_MS} / {styles.BACKDROP_TICK_MS}")
