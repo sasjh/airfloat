@@ -72,6 +72,7 @@ from .styles import (
     GLASS_RING,
     GLASS_SQUASH,
     GLASS_SPECULAR,
+    GLASS_SPECULAR_R,
     LIGHT_TICK_MS,
     RECESS_WASH,
     RING_BOTTOM_LIGHT,
@@ -309,7 +310,9 @@ def paint_glass(
     if specular and GLASS_SPECULAR > 0:
         light_side, _ = _light_axis(rect, light)
         center = light_side + (rect.center() - light_side) * GLASS_LIGHT_SHIFT
-        spread = max(rect.width(), rect.height()) * 0.55
+        # 半径是**像素**、不跟边长走：小卡片上只有一颗小光点（跟着指针走的那粒「光针」），
+        # 按边长铺开的话，一张 176px 的卡片会被这朵光糊掉半个面。
+        spread = GLASS_SPECULAR_R
         hot = QRadialGradient(center, spread)
         hot.setColorAt(0.0, QColor(255, 255, 255, round(255 * GLASS_SPECULAR * lit)))
         hot.setColorAt(0.55, QColor(255, 255, 255, round(255 * GLASS_SPECULAR * 0.28 * lit)))

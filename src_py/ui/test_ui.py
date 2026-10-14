@@ -20,6 +20,8 @@ import os
 import re
 import sys
 import tempfile
+import inspect
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,6 +41,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import ui.main_window as mw  # noqa: E402
+from ui import backdrop as ui_backdrop  # noqa: E402
 from ui import glass as ui_glass  # noqa: E402
 from ui import liquid as ui_liquid  # noqa: E402
 from ui import styles  # noqa: E402
@@ -191,23 +194,83 @@ def main() -> int:
 
     print("\n[3] 材质")
     check("材质对象存在", window._material is not None)
-    check("材质模式可读", window._material.mode in ("acrylic", "blur", "solid"), window._material.mode)
-    # 圆角有**两套**半径，用哪套取决于「谁在裁那层模糊」（见 glass.region_clips_backdrop）：
-    # 纯模糊时模糊跟着窗口区域走（实测 16px 的区域把模糊也裁圆了），圆角归我们管 —— 想多
-    # 圆有多圆，同时必须让 DWM 别插手；亚克力兜底时模糊由 DWM 画、不认区域，圆角只能交给
-    # DWM，半径是系统固定的那档，我们画的弧得跟它同半径，否则四角出现两条不同心的弧。
+    check("材质模式可读", window._material.mode in ("backdrop", "acrylic", "blur", "solid"),
+          window._material.mode)
+    # 圆角只有一条原则：**底是谁画的，圆角就归谁**。底是我们自己抓、自己糊的那层桌面模糊
+    # （backdrop，主路径）时，圆角也由我们画（QPainterPath + 抗锯齿）—— 想多圆有多圆；
+    # 退回 DWM 那层系统模糊时，我们画的弧得跟系统那档同半径，否则四角出现两条不同心的弧。
+    # （DWM 的模糊**不理会窗口区域**、它自己的圆角在这扇无边框窗上实测只有 ~4px，
+    #   所以「大圆弧」这条路只能自己画 —— 见 ui/backdrop.py。）
     check("glass 接的是 DWM 圆角偏好",
           ui_glass.DWMWA_WINDOW_CORNER_PREFERENCE == 33 and ui_glass.DWMWCP_ROUND == 2
           and ui_glass.DWMWCP_DONOTROUND == 1)
-    check("窗口裁剪半径 = 当前生效的那套圆角令牌（绘制与裁剪同一个值）",
-          window._material._region_key is not None
-          and window._material._region_key[2] == window._window_radius(),
-          str(window._material._region_key))
-    check("整套半径与文档一致：自己裁 16 / 系统裁 8",
-          (mw.RADIUS_WINDOW, mw.RADIUS_WINDOW_SYSTEM) == (16, 8),
+    check("整套半径与文档一致：自己画 20 / 系统那档 8",
+          (mw.RADIUS_WINDOW, mw.RADIUS_WINDOW_SYSTEM) == (20, 8),
           f"{mw.RADIUS_WINDOW} / {mw.RADIUS_WINDOW_SYSTEM}")
-    check("两条圆角规则互斥：DWM 在裁圆角时，区域就不再负责裁模糊（不会各裁一刀）",
-          not (window._material.rounded_by_dwm and window._material.region_clips_backdrop))
+    saved_mode = window._material._mode
+    window._material._mode = ui_glass.MODE_BACKDROP
+    ours_radius = window._window_radius()
+    window._material._mode = ui_glass.MODE_BLUR
+    fallback_radius = window._window_radius()
+    window._material._mode = saved_mode
+    check("底是自己画的 ⇒ 圆角取我们那一档；退回系统模糊 ⇒ 取系统那档",
+          ours_radius == mw.RADIUS_WINDOW and fallback_radius == mw.RADIUS_WINDOW_SYSTEM,
+          f"{ours_radius} / {fallback_radius}")
+    probe_material = ui_glass.GlassMaterial()
+    probe_mode = probe_material.attach(int(window.winId()), 0x22141C26, backdrop=True)
+    check("backdrop=True ⇒ 自绘底那条路：DWM 模糊关掉、圆角让开",
+          probe_mode == ui_glass.MODE_BACKDROP and probe_material.backdrop_is_ours
+          and not probe_material.rounded_by_dwm,
+          f"{probe_mode} / dwm={probe_material.rounded_by_dwm}")
+    check("自绘底：抓屏那一瞬间把自己从画面里摘掉（否则会抓到自己）",
+          ui_backdrop.WDA_EXCLUDEFROMCAPTURE == 0x11
+          and (styles.BACKDROP_TICK_MS, styles.BACKDROP_BLUR_PX, styles.BACKDROP_BLUR_HALF)
+          == (ui_backdrop.BACKDROP_TICK_MS, ui_backdrop.BACKDROP_BLUR_PX,
+              ui_backdrop.BACKDROP_BLUR_HALF)
+          and ui_backdrop.BACKDROP_TICK_MS > 0 and ui_backdrop.BACKDROP_BLUR_PX > 0,
+          str(ui_backdrop.BACKDROP_TICK_MS))
+    # 背后那层桌面得**真的糊掉**，但也不能糊成一片。这两只旋钮看着像性能参数，其实是观感参数：
+    #   太弱（σ≈4px）壁纸线条、桌面图标照样看得清 —— 「投过来的背景怎么还是高清」；
+    #   太狠（σ≈16px）糊成一片马赛克、结构全没了 —— 「没之前那版自然」。
+    # 量法：一条竖直线从 10% 亮到 90% 跨过的像素（越大越糊），与观感直接对应，不看参数猜。
+    step = QImage(400, 24, QImage.Format.Format_RGB32)
+    for x in range(400):
+        tone = QColor(0, 0, 0) if x < 200 else QColor(255, 255, 255)
+        for y in range(24):
+            step.setPixelColor(x, y, tone)
+
+    def _rise(blurred: QImage) -> int:
+        row = [blurred.pixelColor(x, blurred.height() // 2).red() for x in range(blurred.width())]
+        return (max(x for x, v in enumerate(row) if v <= 229)
+                - min(x for x, v in enumerate(row) if v >= 26))
+
+    rise = _rise(ui_backdrop._blur(step))
+    check("背后那层桌面：糊够了、又没糊成一片（10%→90% 落在 16..45px）",
+          16 <= rise <= 45, f"真高斯 {rise}px")
+    fallback_rise = _rise(ui_backdrop._box_blur(step))
+    check("没有 Pillow 的兜底路径也得糊够（缩 20 倍糊 3 遍）",
+          fallback_rise >= 16, f"兜底 {fallback_rise}px")
+    paused = ui_backdrop.Backdrop()
+    paused.attach(window)
+    paused.suspend()
+    check("自绘底：暂停期间不抓屏（拖动 / 缩放时不白花 CPU）", paused.refresh() is False)
+    # 拖动时窗口在动，背后的桌面也得跟着动，但不能贴着每帧抓（抓一次 ~7ms，会掉帧）：
+    # moveEvent / resizeEvent 都走限速那条路，停手后再补一张最新的。
+    throttled = ui_backdrop.Backdrop()
+    grabbed: list[int] = []
+    throttled.refresh = lambda: (grabbed.append(1), True)[1]
+    throttled._last = time.monotonic()
+    check("自绘底：限速跟随 —— 距上次抓成功太近就跳过，不白抓", throttled.refresh_throttled() is False
+          and not grabbed)
+    throttled._last = 0.0
+    check("自绘底：限速跟随 —— 够久了就抓一张（跟着窗口走）",
+          throttled.refresh_throttled() is True and grabbed == [1])
+    check("限速令牌：是个正的间隔，且不超过心跳（比心跳还疏就成了慢动作）",
+          0 < styles.BACKDROP_MOVE_MS <= styles.BACKDROP_TICK_MS,
+          f"{styles.BACKDROP_MOVE_MS} / {styles.BACKDROP_TICK_MS}")
+    paint_src = inspect.getsource(mw.AirFloatWindow.paintEvent)
+    check("自绘底画在最底层（后面所有光影都压在它之上）",
+          paint_src.index("_paint_backdrop") < paint_src.index("paint_glass"))
 
     print("\n[4] 模块卡片：状态显示")
     window.on_state({"enabled": True, "receiveMode": "everyone", "alias": "我的电脑"})
@@ -606,17 +669,20 @@ def main() -> int:
     # ① 指针光：一块玻璃的光影由**光位**决定，光一挪整套光影都得跟着挪。
     #    只开镜面热点（关掉光泽 / 边缘光 / 色差 / 焦散），才量得到热点本身。
     only_spec = {"gloss": False, "rim": False, "aberration": False, "caustic": False}
-    corner_tl, corner_br = QRect(0, 0, 28, 14), QRect(44, 22, 36, 18)
+    # 取样按**受光的那条边**，不按角：光源的锚点落在边上（对角线光位下是顶边 / 底边的**中点**，
+    # 见 ``liquid._light_axis`` 与 ``_edge_hit``）—— 取角会量到「热点够不够大摊到角上」，
+    # 那是半径的事，不是「光跟不跟指针走」的事（半径收到 10 之前，这条用例其实是擦边通过的）。
+    lit_edge, far_edge = QRect(0, 0, 80, 12), QRect(0, 28, 80, 12)
     # 光位全部显式给：这几条量的是**光位 → 光影**的对应关系，不该受全局指针光影响。
     rest_spec = _glass_probe(light=QPointF(*styles.GLASS_LIGHT_REST), **only_spec)
     far_spec = _glass_probe(light=QPointF(0.9, 0.9), **only_spec)
     check("光位可跟（同一块玻璃，光源换了位置就是另一套光）",
           _pixel_diff(rest_spec, far_spec) > 0)
     check("镜面热点朝着光源（静息在左上，指针到右下就跟过去）",
-          _peak_alpha(rest_spec, corner_tl) > _peak_alpha(rest_spec, corner_br)
-          and _peak_alpha(far_spec, corner_br) > _peak_alpha(far_spec, corner_tl),
-          f"{_peak_alpha(rest_spec, corner_tl)}/{_peak_alpha(rest_spec, corner_br)} -> "
-          f"{_peak_alpha(far_spec, corner_tl)}/{_peak_alpha(far_spec, corner_br)}")
+          _peak_alpha(rest_spec, lit_edge) > _peak_alpha(rest_spec, far_edge)
+          and _peak_alpha(far_spec, far_edge) > _peak_alpha(far_spec, lit_edge),
+          f"静息 {_peak_alpha(rest_spec, lit_edge)}/{_peak_alpha(rest_spec, far_edge)} -> "
+          f"指针右下 {_peak_alpha(far_spec, lit_edge)}/{_peak_alpha(far_spec, far_edge)}")
     #    受光边跟着转：光从下面来，下缘就该比上缘亮（整圈亮边的方向是活的）
     only_rim = {"gloss": False, "specular": False, "aberration": False, "caustic": False}
     top_band, bottom_band = QRect(30, 0, 20, 2), QRect(30, 38, 20, 2)
@@ -666,6 +732,10 @@ def main() -> int:
           f"{trail[-1]:.5f}")
     check(f"末段自己收住（最后一小步 {steps[-1]:.5f} < 最大步的 1/20）",
           steps[-1] < max(steps) * 0.05, f"{steps[-1]:.6f} vs {max(steps):.5f}")
+    check("镜面热点很小：走**像素**令牌、且比卡片自己的圆角还小（卡片上是一粒光针）",
+          styles.GLASS_SPECULAR_R <= mw.RADIUS_CARD
+          and "GLASS_SPECULAR_R" in inspect.getsource(ui_liquid.paint_glass),
+          str(styles.GLASS_SPECULAR_R))
     # ④ 内容环境光：只借色调（保色相 / 降饱和 / 夹明度），不能变成彩色塑料
     def borrow(fill: str) -> QColor:
         pixmap = QPixmap(8, 8)

@@ -68,6 +68,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .backdrop import Backdrop
 from .glass import MODE_SOLID, GlassMaterial
 from .glyphs import paint_glyph
 from .liquid import (
@@ -1261,13 +1262,16 @@ class AirFloatWindow(QWidget):
 
         # -- 材质 / 几何 --
         self._material = GlassMaterial()
+        # 桌面那层模糊由我们自己抓、自己糊（DWM 的模糊不理会圆角，四角会露出方角）
+        self._backdrop = Backdrop(self)
+        self._backdrop.changed.connect(self.update)
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self._glass_ready = False
         self._resize_session: dict | None = None
         self._move_session: dict | None = None
         self._resize_settle = QTimer(self)
         self._resize_settle.setSingleShot(True)
-        self._resize_settle.timeout.connect(self._material.resume)
+        self._resize_settle.timeout.connect(self._resume_after_drag)
 
         # -- 指针光 / 内容环境光（让玻璃「活着」）--
         # 整块界面只有**一个光源**：指针在哪，光就从哪来。装应用级过滤器而不是靠事件
@@ -1836,17 +1840,22 @@ class AirFloatWindow(QWidget):
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
-        self._update_region()
+        self._backdrop.refresh_throttled()
         self._position_toast()
         self._sync_columns()
         if self._resize_session is not None:
             self._material.suspend()
+            self._backdrop.suspend()
             self._resize_settle.start(RESIZE_SETTLE_MS)
+
+    def moveEvent(self, e) -> None:  # noqa: N802
+        super().moveEvent(e)
+        self._backdrop.refresh_throttled()
 
     def changeEvent(self, e) -> None:  # noqa: N802
         super().changeEvent(e)
         if e.type() == QEvent.Type.WindowStateChange:
-            QTimer.singleShot(0, self._update_region)
+            QTimer.singleShot(0, self._backdrop.refresh)
 
     def _owns(self, widget: QWidget) -> bool:
         """这个控件算不算本窗口的？
@@ -1880,11 +1889,18 @@ class AirFloatWindow(QWidget):
         super().showEvent(e)
         if not self._glass_ready:
             self._glass_ready = True
-            # 窗口句柄要 show 之后才成立：材质与圆角裁剪都挂在这一刻
-            self._material.attach(int(self.winId()), GLASS_TINT_ABGR)
+            # 窗口句柄要 show 之后才成立：材质挂在这一刻。先试着抓一张桌面 ——
+            # 抓得到（绝大多数情况）就自己画底，抓不到才退回 DWM 那层系统模糊。
+            self._backdrop.attach(self)
+            ours = self._backdrop.start()
+            self._material.attach(int(self.winId()), GLASS_TINT_ABGR, backdrop=ours)
             self._restore_geometry()
-            self._update_region()
+            self._backdrop.refresh()
         self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def hideEvent(self, e) -> None:  # noqa: N802
+        self._backdrop.stop()
+        super().hideEvent(e)
 
     def closeEvent(self, e) -> None:  # noqa: N802
         try:
@@ -1907,27 +1923,14 @@ class AirFloatWindow(QWidget):
             area = screen.availableGeometry()
             self.move(area.center() - QPoint(self.width() // 2, area.height() // 3))
 
-    def _update_region(self) -> None:
-        """窗口内容裁进圆角区域。
-
-        半径由 `_window_radius()` 给：谁在裁那层模糊，圆角就归谁 —— 纯模糊时区域裁得住
-        模糊，圆角归我们（想多圆有多圆）；亚克力兜底时模糊由 DWM 画、圆角也归 DWM，
-        半径只能跟系统那档。绘制与裁剪取同一个值，四角就不会出现两条不同心的弧。
-        """
-        if not self._glass_ready:
-            return
-        self._material.set_rounded(
-            self.width(),
-            self.height(),
-            self._window_radius(),
-            self.devicePixelRatioF(),
-            enabled=not self.isMaximized(),
-        )
-
     def _window_radius(self) -> int:
-        """当前生效的整窗圆角半径（绘制与裁剪共用这一个值）。"""
+        """当前生效的整窗圆角半径。
+
+        底是自己画的那层模糊时，圆角也是我们画的（QPainterPath + 抗锯齿）—— 想多圆有多圆；
+        退回系统模糊时，我们画的弧只能跟 DWM 那档（系统固定的小半径）。
+        """
         material = getattr(self, "_material", None)
-        if material is not None and not material.region_clips_backdrop:
+        if material is not None and not material.backdrop_is_ours:
             return RADIUS_WINDOW_SYSTEM
         return RADIUS_WINDOW
 
@@ -1991,6 +1994,9 @@ class AirFloatWindow(QWidget):
 
         亚克力**不**在移动期间降级：窗口一路保留真实模糊，玻璃才「一路都在」；
         缩放仍然降级 —— 边长每帧都在变，模糊跟不上的错位比降级更显眼。
+
+        自绘的底也跟着走（moveEvent 里限速重抓）：窗口在动，背后的桌面也得跟着动，
+        不然玻璃就像贴在一张旧照片上。限速到 ~14 次/秒，够跟手又不掉帧。
         """
         self._move_session = {"origin": global_pos, "geometry": QRect(self.geometry())}
 
@@ -2004,6 +2010,11 @@ class AirFloatWindow(QWidget):
     def _end_move(self) -> None:
         self._move_session = None
         self._resize_settle.start(RESIZE_SETTLE_MS)
+
+    def _resume_after_drag(self) -> None:
+        """拖动 / 缩放停手：材质与自绘的底一起回到正常（抓屏期间先暂停，免得白花 CPU）。"""
+        self._material.resume()
+        self._backdrop.resume()
 
     def _apply_manual_resize(self, global_pos: QPoint) -> None:
         session = self._resize_session
@@ -2040,7 +2051,7 @@ class AirFloatWindow(QWidget):
         if self._resize_session is not None:
             self._resize_session = None
             self.unsetCursor()
-            QTimer.singleShot(120, self._material.resume)
+            QTimer.singleShot(120, self._resume_after_drag)
             return
         super().mouseReleaseEvent(e)
 
@@ -2051,6 +2062,11 @@ class AirFloatWindow(QWidget):
         radius = 0 if self.isMaximized() else self._window_radius()
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         path = glass_path(rect, radius)
+
+        # ⓪ 桌面底：自己抓、自己糊的那层真实模糊，裁进圆角（抗锯齿）。
+        #    这是整块玻璃的「背景」，DWM 那层系统模糊此时是关掉的 —— 它不理会圆角，
+        #    留着就会在四角露出方形的模糊块。后面所有光影都压在这层之上。
+        self._paint_backdrop(p, path)
 
         # 降级：拿不到真实模糊时，铺一层接近材质色的薄膜，别让窗口变成透明水印
         if self._material.mode == MODE_SOLID:
@@ -2091,6 +2107,17 @@ class AirFloatWindow(QWidget):
             p, rect, radius, lit=GLASS_LIT_WINDOW, gloss=False, specular=False, aberration=False
         )
         p.end()
+
+    def _paint_backdrop(self, p: QPainter, path) -> None:
+        """把自绘的桌面底铺进圆角路径里。抓不到桌面时什么都不画（退回系统模糊那条路）。"""
+        pixmap = self._backdrop.pixmap()
+        if pixmap is None:
+            return
+        p.save()
+        p.setClipPath(path)
+        # 拉伸铺满：本来就是一糊了之的图，差一两个像素看不出来，不必锱铢必较
+        p.drawPixmap(self.rect(), pixmap)
+        p.restore()
 
     def _ambient_center(self, rect: QRectF) -> QPointF:
         """染光中心 = 图片口中心（内容在那儿，颜色就从那儿漫出来）。"""
